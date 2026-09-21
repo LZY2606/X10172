@@ -18,6 +18,7 @@ package ttrpc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math/rand"
@@ -41,6 +42,7 @@ type Server struct {
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
 	done        chan struct{}            // marks point at which we stop serving requests
+	draining    bool                     // server is gracefully draining connections
 }
 
 func NewServer(opts ...ServerOpt) (*Server, error) {
@@ -285,15 +287,25 @@ func (cs connState) String() string {
 
 func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 	c := &serverConn{
-		server:    s,
-		conn:      conn,
-		handshake: handshake,
-		shutdown:  make(chan struct{}),
+		server:          s,
+		conn:            conn,
+		handshake:       handshake,
+		shutdown:        make(chan struct{}),
+		drainCh:         make(chan struct{}),
+		drainAnnounceCh: make(chan struct{}, 1),
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
 		c.close()
 		return nil, err
+	}
+	s.mu.Lock()
+	draining := s.draining
+	s.mu.Unlock()
+	if draining {
+		// The server entered maintenance before this connection was
+		// accepted: drain it immediately with an empty boundary.
+		c.startDrain()
 	}
 	return c, nil
 }
@@ -306,6 +318,21 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	// lastStreamID is the highest client initiated stream id received on
+	// this connection. It is written by the receive goroutine and read
+	// when computing the drain boundary.
+	lastStreamID atomic.Uint32
+
+	drainOnce sync.Once
+	drainCh   chan struct{} // closed by startDrain to initiate a graceful drain
+
+	drained       atomic.Bool   // drain boundary has been computed
+	drainBoundary atomic.Uint32 // last accepted stream id, valid once drained is set
+	drainCapable  atomic.Bool   // peer announced drain support via request metadata
+
+	drainAnnounceOnce sync.Once
+	drainAnnounceCh   chan struct{} // requests the run loop to send the drain control frame
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -345,13 +372,14 @@ func (c *serverConn) run(sctx context.Context) {
 		done                   = make(chan struct{})
 		streams                = sync.Map{}
 		active       int32
-		lastStreamID uint32
+		drain                  = c.drainCh
 	)
 
 	defer c.conn.Close()
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
+	defer c.setState(connStateClosed)
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -441,6 +469,7 @@ func (c *serverConn) run(sctx context.Context) {
 					}
 				}
 			} else if mh.Type == messageTypeRequest {
+				lastStreamID := c.lastStreamID.Load()
 				if mh.StreamID <= lastStreamID {
 					// enforce odd client initiated identifiers.
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID cannot be re-used and must increment")) {
@@ -449,7 +478,7 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 
 				}
-				lastStreamID = mh.StreamID
+				c.lastStreamID.Store(mh.StreamID)
 
 				// TODO: Make request type configurable
 				// Unmarshaller which takes in a byte array and returns an interface?
@@ -462,6 +491,21 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 				}
 				ch.putmbuf(p)
+
+				if stripDrainCapability(&req) {
+					c.setDrainCapable()
+				}
+
+				if c.drained.Load() && mh.StreamID > c.drainBoundary.Load() {
+					// The connection is draining and this request was
+					// received after the boundary: reject it with a
+					// stable, recognizable status instead of relying on
+					// connection close timing.
+					if !sendStatus(mh.StreamID, drainingStatus()) {
+						return
+					}
+					continue
+				}
 
 				id := mh.StreamID
 				respond := func(status *status.Status, data []byte, streaming, closeStream bool) error {
@@ -562,6 +606,27 @@ func (c *serverConn) run(sctx context.Context) {
 			}
 			log.G(ctx).WithError(err).Error("error receiving message")
 			// else, initiate shutdown
+		case <-drain:
+			// A graceful drain was requested. Fix the boundary at the
+			// last received stream id exactly once; requests received
+			// afterwards are rejected by the receive goroutine. The
+			// boundary never regresses for the lifetime of the
+			// connection.
+			if c.drained.CompareAndSwap(false, true) {
+				c.drainBoundary.Store(c.lastStreamID.Load())
+				if c.drainCapable.Load() {
+					c.requestDrainAnnounce()
+				}
+			}
+			drain = nil
+		case <-c.drainAnnounceCh:
+			// The peer negotiated drain support: publish the boundary.
+			var p [controlFramePayloadLength]byte
+			binary.BigEndian.PutUint32(p[:], c.drainBoundary.Load())
+			if err := ch.send(0, messageTypeControl, controlKindDrain, p[:]); err != nil {
+				log.G(ctx).WithError(err).Error("ttrpc: failed sending drain control frame")
+				return
+			}
 		case <-shutdown:
 			return
 		}

@@ -56,6 +56,7 @@ initiated streams. Server initiated streams are not currently supported.
 | 0x01         | Request  | Initiates stream                 |
 | 0x02         | Response | Final stream data and terminates |
 | 0x03         | Data     | Stream data                      |
+| 0x04         | Control  | Connection level control frame   |
 
 ### Request
 
@@ -109,6 +110,56 @@ considered data and should be processed.
 |------|-----------------|-----------------------------------|
 | 0x01 | `remote closed` | No more data expected from remote |
 | 0x04 | `no data`       | This message does not have data   |
+
+### Control
+
+The control message carries connection level control frames which are not
+part of any stream. The Stream ID field of a control frame must be zero and
+must be ignored by the receiver. The Flags field identifies the control
+frame kind. Control frames are optional: a receiver must ignore control
+frames with kinds it does not recognize, and a receiver that does not
+implement control frames at all must ignore the whole frame. Control frames
+must never be dispatched as stream messages.
+
+#### Control Frame Kinds
+
+| Flag | Name   | Description                                   |
+|------|--------|-----------------------------------------------|
+| 0x01 | `drain` | Announces the last accepted stream id        |
+
+#### Drain Control Frame
+
+The drain control frame is sent by the server to announce a graceful
+connection drain. The payload is exactly 4 bytes: a big-endian unsigned
+32-bit integer holding the last stream id the server accepted on this
+connection (the drain boundary). A boundary of zero means no stream was
+accepted.
+
+Streams received by the server up to and including the boundary complete
+normally, including client half-close, server half-close and the final
+response, in the usual order. Any request received after the boundary is
+rejected with a response carrying the gRPC status code `Unavailable` and
+the message `ttrpc: connection is draining`. The rejection is stable: it
+does not depend on connection close timing and a client may fail new calls
+fast with the same status once it has observed the boundary.
+
+The boundary is monotonic for the lifetime of a connection: it is fixed
+when the drain starts and never regresses, so duplicated or delayed drain
+frames carrying a smaller boundary must be ignored. Each connection has
+its own boundary; reconnecting starts a new connection with its own
+boundary.
+
+#### Drain Capability Negotiation
+
+Drain support is negotiated over the existing request metadata channel. A
+client that implements draining attaches the reserved metadata key
+`ttrpc-drain-capable` to every request it sends. Upon observing the key,
+the server records the connection as drain capable and strips the key, so
+the key is never visible to service handlers. A server must only send
+control frames on connections that announced the capability; a client that
+did not announce it never receives control frames. A server that does not
+implement draining ignores the key and simply never sends control frames,
+which is indistinguishable from a server that never drains.
 
 ## Streaming
 
@@ -238,3 +289,4 @@ routing by procedure name and a response type which supports call status.
 |---------|---------------------|
 | 1.0     | Unary requests only |
 | 1.2     | Streaming support   |
+| 1.3     | Graceful connection drain |

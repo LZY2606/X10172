@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,6 +51,12 @@ type Client struct {
 	closeOnce       sync.Once
 	userCloseFunc   func()
 	userCloseWaitCh chan struct{}
+
+	drainSupport  bool
+	drainOnce     sync.Once
+	drainedCh     chan struct{}
+	drained       atomic.Bool
+	drainBoundary atomic.Uint32
 
 	interceptor UnaryClientInterceptor
 }
@@ -121,6 +128,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+		drainedCh:       make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -366,6 +374,10 @@ func (c *Client) receiveLoop() error {
 					return filterCloseErr(err)
 				}
 			}
+			if err == nil && msg.header.Type == messageTypeControl && c.drainSupport {
+				c.handleControl(msg.header, msg.payload)
+				continue
+			}
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
@@ -401,6 +413,15 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	case <-c.ctx.Done():
 		return nil, ErrClosed
 	default:
+	}
+
+	// Fail fast once the server announced a connection drain. The
+	// boundary published by the server never exceeds the last allocated
+	// stream id, so any new stream would be rejected by the server
+	// anyway; rejecting here makes the result deterministic instead of
+	// depending on frame timing.
+	if c.drained.Load() {
+		return nil, ErrConnectionDraining
 	}
 
 	var s *stream
@@ -506,6 +527,7 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 		Payload: payload,
 		// TODO: metadata from context
 	}
+	c.setDrainCapability(request)
 	p, err := c.codec.Marshal(request)
 	if err != nil {
 		return nil, err
@@ -531,6 +553,8 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 }
 
 func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) error {
+	c.setDrainCapability(req)
+
 	p, err := c.codec.Marshal(req)
 	if err != nil {
 		return err
