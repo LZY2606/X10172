@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -43,6 +44,17 @@ type Client struct {
 	streams      map[streamID]*stream
 	nextStreamID streamID
 	sendLock     sync.Mutex
+
+	// gracefulDrain enables negotiation of the optional drain feature.
+	// When enabled the client advertises the feature through request
+	// metadata and processes connection scoped control frames.
+	gracefulDrain bool
+	// drainBoundary is the last stream id accepted by the server before
+	// draining. It is only consulted after drainObserved is closed and
+	// only ever moves forward.
+	drainBoundary atomic.Uint32
+	drainOnce     sync.Once
+	drainObserved chan struct{}
 
 	ctx    context.Context
 	closed func()
@@ -93,6 +105,22 @@ func WithChainUnaryClientInterceptor(interceptors ...UnaryClientInterceptor) Cli
 	}
 }
 
+// WithClientGracefulDrain enables the optional graceful drain protocol
+// on the client. Drain-aware clients advertise the feature to the
+// server using request metadata; when the server drains the connection
+// it sends a control frame announcing the last accepted stream id, and
+// calls created beyond that boundary fail with an error for which
+// IsServerDraining returns true, instead of failing through a closed
+// connection.
+//
+// When this option is not set the client uses exactly the historical
+// wire format and behavior, including against drain-aware servers.
+func WithClientGracefulDrain() ClientOpts {
+	return func(c *Client) {
+		c.gracefulDrain = true
+	}
+}
+
 func chainUnaryInterceptors(interceptors []UnaryClientInterceptor, final Invoker, info *UnaryClientInfo) Invoker {
 	if len(interceptors) == 0 {
 		return final
@@ -121,6 +149,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+		drainObserved:   make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -367,6 +396,26 @@ func (c *Client) receiveLoop() error {
 				}
 			}
 			sid := streamID(msg.header.StreamID)
+			if err == nil && msg.header.Type == messageTypeControl {
+				if sid != streamID(controlStreamID) {
+					log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received control message on an rpc stream")
+					continue
+				}
+				payload := msg.payload
+				cf, cerr := decodeControlFrame(payload)
+				if payload != nil {
+					c.channel.putmbuf(payload)
+				}
+				if cerr != nil {
+					log.G(c.ctx).WithError(cerr).Error("ttrpc: malformed control message")
+					continue
+				}
+				if cf.hasDrain {
+					c.observeDrain(cf.drainEnd)
+				}
+				continue
+			}
+
 			s := c.getStream(sid)
 			if s == nil {
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
@@ -386,7 +435,7 @@ func (c *Client) receiveLoop() error {
 
 // createStream creates a new stream and registers it with the client
 // Introduce stream types for multiple or single response
-func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, error) {
+func (c *Client) createStream(flags uint8, req *Request, recvBuf int) (*stream, error) {
 	// sendLock must be held across both allocation of the stream ID and sending it across the wire.
 	// This ensures that new stream IDs sent on the wire are always increasing, which is a
 	// requirement of the TTRPC protocol.
@@ -417,20 +466,81 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		default:
 		}
 
-		s = newStream(c.nextStreamID, c, recvBuf)
+		newID := c.nextStreamID
+		if boundary, draining := c.drainState(); draining && newID > streamID(boundary) {
+			return newDrainingError(boundary)
+		}
+
+		s = newStream(newID, c, recvBuf)
 		c.streams[s.id] = s
-		c.nextStreamID = c.nextStreamID + 2
+		c.nextStreamID = newID + 2
 
 		return nil
 	}(); err != nil {
 		return nil, err
 	}
 
-	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
+	p, err := c.marshalRequest(req)
+	if err != nil {
+		return s, err
+	}
+
+	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, p); err != nil {
 		return s, filterCloseErr(err)
 	}
 
 	return s, nil
+}
+
+// marshalRequest serializes a request and, when the client opted into
+// graceful drain, advertises the feature so the server may send drain
+// control frames. The advertisement is applied at serialization time so
+// it never mutates the caller-supplied metadata.
+func (c *Client) marshalRequest(req *Request) ([]byte, error) {
+	if c.gracefulDrain {
+		clone := *req
+		clone.Metadata = make([]*KeyValue, 0, len(req.Metadata)+1)
+		clone.Metadata = append(clone.Metadata, req.Metadata...)
+		clone.Metadata = append(clone.Metadata, &KeyValue{Key: featureMetadataKey, Value: featureDrain})
+		req = &clone
+	}
+	return c.codec.Marshal(req)
+}
+
+// drainState returns the current drain boundary and whether a drain has
+// been observed. The boundary is monotonic for the life of the
+// connection.
+func (c *Client) drainState() (uint32, bool) {
+	if !c.gracefulDrain {
+		return 0, false
+	}
+	select {
+	case <-c.drainObserved:
+		return c.drainBoundary.Load(), true
+	default:
+		return 0, false
+	}
+}
+
+// observeDrain records a drain boundary announced by the server. A
+// repeated or delayed announcement never moves the boundary backwards.
+func (c *Client) observeDrain(boundary uint32) {
+	if !c.gracefulDrain {
+		return
+	}
+	c.drainOnce.Do(func() {
+		c.drainBoundary.Store(boundary)
+		close(c.drainObserved)
+	})
+	for {
+		current := c.drainBoundary.Load()
+		if boundary <= current {
+			return
+		}
+		if c.drainBoundary.CompareAndSwap(current, boundary) {
+			return
+		}
+	}
 }
 
 func (c *Client) deleteStream(s *stream) {
@@ -506,18 +616,13 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 		Payload: payload,
 		// TODO: metadata from context
 	}
-	p, err := c.codec.Marshal(request)
-	if err != nil {
-		return nil, err
-	}
-
 	var flags uint8
 	if desc.StreamingClient {
 		flags = flagRemoteOpen
 	} else {
 		flags = flagRemoteClosed
 	}
-	s, err := c.createStream(flags, p, streamRecvBufferSize)
+	s, err := c.createStream(flags, request, streamRecvBufferSize)
 	if err != nil {
 		return nil, err
 	}
@@ -531,12 +636,7 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 }
 
 func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) error {
-	p, err := c.codec.Marshal(req)
-	if err != nil {
-		return err
-	}
-
-	s, err := c.createStream(0, p, 1)
+	s, err := c.createStream(0, req, 1)
 	if err != nil {
 		return err
 	}

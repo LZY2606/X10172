@@ -24,6 +24,24 @@ import (
 type serverConfig struct {
 	handshaker  Handshaker
 	interceptor UnaryServerInterceptor
+	gracefulDrain bool
+}
+
+// WithServerGracefulDrain enables the optional graceful drain
+// protocol. Drain-aware clients negotiate the feature through request
+// metadata; once the server starts draining (see Server.Drain), each
+// negotiated connection is told the last stream id it will accept,
+// streams at or before that boundary complete normally, and later calls
+// fail with a stable Unavailable drain rejection instead of racing a
+// connection close.
+//
+// Servers created without this option keep the historical behavior and
+// wire format exactly, even when speaking to drain-aware clients.
+func WithServerGracefulDrain() ServerOpt {
+	return func(c *serverConfig) error {
+		c.gracefulDrain = true
+		return nil
+	}
 }
 
 // ServerOpt for configuring a ttrpc server

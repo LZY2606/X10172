@@ -41,6 +41,12 @@ type Server struct {
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
 	done        chan struct{}            // marks point at which we stop serving requests
+	draining    chan struct{}            // marks the point at which graceful draining started
+
+	// cond is signaled (Broadcast) whenever a connection is added or
+	// removed, allowing Shutdown/Drain to wait for quiescence without
+	// polling.
+	cond *sync.Cond
 }
 
 func NewServer(opts ...ServerOpt) (*Server, error) {
@@ -54,13 +60,16 @@ func NewServer(opts ...ServerOpt) (*Server, error) {
 		config.interceptor = defaultServerInterceptor
 	}
 
-	return &Server{
+	srv := &Server{
 		config:      config,
 		services:    newServiceSet(config.interceptor),
 		done:        make(chan struct{}),
+		draining:    make(chan struct{}),
 		listeners:   make(map[net.Listener]struct{}),
 		connections: make(map[*serverConn]struct{}),
-	}, nil
+	}
+	srv.cond = sync.NewCond(&srv.mu)
+	return srv, nil
 }
 
 // Register registers a map of methods to method handlers
@@ -153,24 +162,63 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		close(s.done)
 	}
 	lnerr := s.closeListeners()
+	// Connections already idle have nothing left to drain; close them
+	// once so they do not have to wait for their next state transition.
+	s.closeIdleConnsLocked()
+	waitErr := s.waitConnectionsLocked(ctx)
 	s.mu.Unlock()
 
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		s.closeIdleConns()
+	if waitErr != nil {
+		return waitErr
+	}
+	return lnerr
+}
 
-		if s.countConnection() == 0 {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
+// Drain starts graceful draining of the server.
+//
+// Listeners are closed so no new connections are accepted. On every
+// connection that negotiated graceful drain, the server announces the
+// last stream id it accepts: streams at or before that boundary are
+// allowed to finish with their normal request, data and response
+// ordering, while later calls fail with a stable Unavailable drain
+// rejection. Drain waits for the remaining connections to complete; it
+// never forcibly cancels an in-flight rpc. If ctx is cancelled before
+// quiescence, Drain returns the context error and leaves the remaining
+// connections running.
+//
+// Starting a drain more than once, or calling Drain concurrently with
+// Shutdown, is idempotent: all calls wait for the same quiescence point.
+// On a server created without WithServerGracefulDrain, Drain behaves
+// exactly like Shutdown, so callers do not need to know whether the
+// feature was enabled.
+func (s *Server) Drain(ctx context.Context) error {
+	if !s.config.gracefulDrain {
+		return s.Shutdown(ctx)
 	}
 
+	s.mu.Lock()
+	select {
+	case <-s.draining:
+	default:
+		close(s.draining)
+	}
+	select {
+	case <-s.done:
+	default:
+		close(s.done)
+	}
+	lnerr := s.closeListeners()
+	for c := range s.connections {
+		// Trigger the per-connection drain announcement. beginDrain is
+		// idempotent, so concurrent Shutdown/Close races are harmless.
+		c.beginDrain()
+	}
+	waitErr := s.waitConnectionsLocked(ctx)
+	s.mu.Unlock()
+
+	if waitErr != nil {
+		return waitErr
+	}
 	return lnerr
 }
 
@@ -191,6 +239,7 @@ func (s *Server) Close() error {
 		c.close()
 		delete(s.connections, c)
 	}
+	s.cond.Broadcast()
 
 	return err
 }
@@ -232,6 +281,7 @@ func (s *Server) addConnection(c *serverConn) error {
 	}
 
 	s.connections[c] = struct{}{}
+	s.cond.Broadcast()
 	return nil
 }
 
@@ -240,25 +290,63 @@ func (s *Server) delConnection(c *serverConn) {
 	defer s.mu.Unlock()
 
 	delete(s.connections, c)
+	s.cond.Broadcast()
 }
 
-func (s *Server) countConnection() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return len(s.connections)
-}
-
-func (s *Server) closeIdleConns() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *Server) closeIdleConnsLocked() {
 	for c := range s.connections {
 		if st, ok := c.getState(); !ok || st == connStateActive {
 			continue
 		}
 		c.close()
 		delete(s.connections, c)
+	}
+}
+
+// waitConnectionsLocked blocks until no connections remain. The caller
+// must hold s.mu; the mutex is released while waiting and reacquired
+// before returning. Connection additions and removals broadcast on
+// s.cond.
+func (s *Server) waitConnectionsLocked(ctx context.Context) error {
+	if ctx.Done() == nil {
+		for len(s.connections) > 0 {
+			s.cond.Wait()
+		}
+		return nil
+	}
+
+	// Wake the waiter when ctx is cancelled. The goroutine exits once
+	// the wait returns (either quiescence or ctx cancellation).
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.mu.Lock()
+			s.cond.Broadcast()
+			s.mu.Unlock()
+		case <-stop:
+		}
+	}()
+
+	for len(s.connections) > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		s.cond.Wait()
+	}
+	return nil
+}
+
+// isDraining reports whether a graceful drain has been started.
+func (s *Server) isDraining() bool {
+	select {
+	case <-s.draining:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -289,6 +377,7 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		conn:      conn,
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
+		drainReq:  make(chan struct{}, 1),
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
@@ -306,6 +395,22 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	// drainReq is signaled at most once (see beginDrain) to ask the
+	// connection's run loop to announce the drain boundary.
+	drainReq chan struct{}
+	drainOnce sync.Once
+
+	// drainCapable is set from the receive goroutine when the client
+	// advertises the drain feature in request metadata. Only then may a
+	// control frame be sent.
+	drainCapable atomic.Bool
+
+	// lastStreamID is the highest request stream id received so far and
+	// drainBoundary is the announced last accepted stream id. Both are
+	// accessed by the receive goroutine and the run loop.
+	lastStreamID  atomic.Uint32
+	drainBoundary atomic.Uint32
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -323,6 +428,18 @@ func (c *serverConn) close() error {
 	})
 
 	return nil
+}
+
+// beginDrain requests the connection to announce a drain boundary. It is
+// idempotent: repeated calls, including concurrent Shutdown and Drain,
+// collapse onto a single announcement.
+func (c *serverConn) beginDrain() {
+	c.drainOnce.Do(func() {
+		select {
+		case c.drainReq <- struct{}{}:
+		default:
+		}
+	})
 }
 
 func (c *serverConn) run(sctx context.Context) {
@@ -344,9 +461,9 @@ func (c *serverConn) run(sctx context.Context) {
 		recvErr                = make(chan error, 1)
 		done                   = make(chan struct{})
 		streams                = sync.Map{}
-		active       int32
-		lastStreamID uint32
+		active int32
 	)
+	var draining bool
 
 	defer c.conn.Close()
 	defer cancel()
@@ -400,8 +517,31 @@ func (c *serverConn) run(sctx context.Context) {
 			}
 
 			if mh.StreamID%2 != 1 {
+				// Control frames are connection scoped and use stream id 0,
+				// which is even.
+				if mh.Type == messageTypeControl && mh.StreamID == controlStreamID {
+					// A client never initiates control frames in this
+					// version; discard the payload and ignore the frame so
+					// peers with other or future control items do not poison
+					// the connection.
+					if p != nil {
+						ch.putmbuf(p)
+					}
+					continue
+				}
 				// enforce odd client initiated identifiers.
 				if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID must be odd for client initiated streams")) {
+					return
+				}
+				continue
+			}
+
+			if mh.Type == messageTypeControl {
+				// Control frames on an rpc stream id are invalid.
+				if p != nil {
+					ch.putmbuf(p)
+				}
+				if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "control messages are connection scoped")) {
 					return
 				}
 				continue
@@ -441,7 +581,7 @@ func (c *serverConn) run(sctx context.Context) {
 					}
 				}
 			} else if mh.Type == messageTypeRequest {
-				if mh.StreamID <= lastStreamID {
+				if mh.StreamID <= c.lastStreamID.Load() {
 					// enforce odd client initiated identifiers.
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID cannot be re-used and must increment")) {
 						return
@@ -449,7 +589,6 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 
 				}
-				lastStreamID = mh.StreamID
 
 				// TODO: Make request type configurable
 				// Unmarshaller which takes in a byte array and returns an interface?
@@ -462,6 +601,24 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 				}
 				ch.putmbuf(p)
+
+				if c.server.config.gracefulDrain && requestAdvertisesDrain(&req) {
+					c.drainCapable.Store(true)
+				}
+
+				// Reject streams created beyond the drain boundary. The
+				// boundary is a snapshot of lastStreamID taken by
+				// beginDrain, so this frame was either accepted before the
+				// announcement or it deterministically fails here with the
+				// stable drain status; acceptance never depends on close
+				// timing.
+				if boundary, draining := c.drainState(); draining && mh.StreamID > boundary {
+					if !sendStatus(mh.StreamID, drainingStatus(boundary)) {
+						return
+					}
+					continue
+				}
+				c.lastStreamID.Store(mh.StreamID)
 
 				id := mh.StreamID
 				respond := func(status *status.Status, data []byte, streaming, closeStream bool) error {
@@ -500,6 +657,12 @@ func (c *serverConn) run(sctx context.Context) {
 			shutdown chan struct{}
 		)
 
+		// Once draining has been announced and no stream is active, this
+		// connection has nothing left to do.
+		if draining && atomic.LoadInt32(&active) == 0 {
+			return
+		}
+
 		activeN := atomic.LoadInt32(&active)
 		if activeN > 0 {
 			newstate = connStateActive
@@ -514,6 +677,22 @@ func (c *serverConn) run(sctx context.Context) {
 		}
 
 		select {
+		case <-c.drainReq:
+			announced, err := c.announceDrain(ch)
+			if err != nil {
+				log.G(ctx).WithError(err).Error("failed sending drain control message")
+				return
+			}
+			// Only drain-aware clients are rejected at the boundary;
+			// connections that did not negotiate the feature keep the
+			// historical shutdown semantics.
+			if announced {
+				draining = true
+			} else if activeN == 0 {
+				// Non-negotiated idle connection: nothing to wait for,
+				// behave like an idle connection under Shutdown.
+				return
+			}
 		case response := <-responses:
 			if !response.streaming || response.status.Code() != codes.OK {
 				p, err := c.server.codec.Marshal(&Response{
@@ -564,6 +743,14 @@ func (c *serverConn) run(sctx context.Context) {
 			// else, initiate shutdown
 		case <-shutdown:
 			return
+		case <-c.server.done:
+			// The server has been asked to stop. An idle connection has
+			// no outstanding work and exits on its own; active
+			// connections keep completing their streams and exit when
+			// they next become idle.
+			if activeN == 0 {
+				return
+			}
 		}
 	}
 }
