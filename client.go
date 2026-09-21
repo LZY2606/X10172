@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -51,6 +52,13 @@ type Client struct {
 	userCloseFunc   func()
 	userCloseWaitCh chan struct{}
 
+	drainEnabled  bool
+	draining      atomic.Bool
+	drainBoundary atomic.Uint32
+	drainOnce     sync.Once
+	drainCh       chan struct{}
+	peerCaps      atomic.Uint32
+
 	interceptor UnaryClientInterceptor
 }
 
@@ -61,6 +69,18 @@ type ClientOpts func(c *Client)
 func WithOnClose(onClose func()) ClientOpts {
 	return func(c *Client) {
 		c.userCloseFunc = onClose
+	}
+}
+
+// WithClientDrain enables the connection drain capability on the client.
+// The client announces the capability to the server during connection
+// setup and, once the server publishes a drain boundary, new calls are
+// rejected locally with ErrDraining while in-flight calls are allowed to
+// complete. Drained returns a channel that can be used to observe the
+// start of a drain.
+func WithClientDrain() ClientOpts {
+	return func(c *Client) {
+		c.drainEnabled = true
 	}
 }
 
@@ -121,6 +141,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+		drainCh:         make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -337,7 +358,24 @@ func (c *Client) UserOnCloseWait(ctx context.Context) error {
 	}
 }
 
+// Drained returns a channel that is closed once the server has announced
+// a connection drain boundary. After the channel is closed, in-flight
+// calls continue to completion while new calls fail with ErrDraining.
+// The channel never closes if the client was not created with
+// WithClientDrain or the server never initiates a drain.
+func (c *Client) Drained() <-chan struct{} {
+	return c.drainCh
+}
+
 func (c *Client) run() {
+	if c.drainEnabled {
+		// Announce the drain capability before any stream is created so
+		// the server observes it ahead of the first request. A failure
+		// here is not terminal; the receive loop surfaces it.
+		if err := c.send(0, messageTypeControl, controlKindHello, controlHelloPayload(capabilityDrain)); err != nil {
+			log.G(c.ctx).WithError(err).Debug("ttrpc: failed to send capability announcement")
+		}
+	}
 	err := c.receiveLoop()
 	c.Close()
 	c.cleanupStreams(err)
@@ -365,6 +403,10 @@ func (c *Client) receiveLoop() error {
 					// all others poison the connection.
 					return filterCloseErr(err)
 				}
+			}
+			if err == nil && msg.header.Type == messageTypeControl {
+				c.handleControl(msg)
+				continue
 			}
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
@@ -401,6 +443,13 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	case <-c.ctx.Done():
 		return nil, ErrClosed
 	default:
+	}
+
+	// Once the server has published a drain boundary, any new stream
+	// identifier would lie past it and be rejected. Fail fast locally
+	// with a stable error instead of depending on the wire round trip.
+	if c.draining.Load() && c.nextStreamID > streamID(c.drainBoundary.Load()) {
+		return nil, ErrDraining
 	}
 
 	var s *stream
