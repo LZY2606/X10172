@@ -42,7 +42,34 @@ var (
 	// connection's receive loop. This prevents a single unconsumed
 	// stream from deadlocking all other streams on the same connection.
 	ErrStreamFull = errors.New("ttrpc: stream buffer full")
+
+	// ErrConnectionDraining is the stable rejection returned for new RPCs
+	// whose stream IDs fall after a server-advertised graceful drain
+	// boundary. It maps to a gRPC status with codes.Unavailable, so the
+	// same rejection is recognizable whether it was generated locally by
+	// an informed client or received on the wire from the server.
+	ErrConnectionDraining = drainingError{}
 )
+
+// drainingMessage is the exact status message used for drain rejections. It is
+// part of the wire contract: clients recognize a server-generated rejection by
+// its codes.Unavailable status and this message.
+const drainingMessage = "ttrpc: connection is draining"
+
+type drainingError struct{}
+
+func (drainingError) Error() string { return drainingMessage }
+
+// IsDrainingError reports whether err is a graceful drain rejection, either a
+// local ErrConnectionDraining or a codes.Unavailable status received from a
+// draining server. It does not match generic Unavailable errors.
+func IsDrainingError(err error) bool {
+	if errors.Is(err, ErrConnectionDraining) {
+		return true
+	}
+	st, ok := status.FromError(err)
+	return ok && st.Code() == codes.Unavailable && st.Message() == drainingMessage
+}
 
 // OversizedMessageErr is used to indicate refusal to send an oversized message.
 // It wraps a ResourceExhausted grpc Status together with the offending message

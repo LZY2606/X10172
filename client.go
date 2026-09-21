@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -52,6 +53,16 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+
+	// gracefulDrain enables the control-frame handshake for the optional
+	// graceful drain protocol.
+	gracefulDrain bool
+	// drainOnce guards drainObserved and drainBound, which record the last
+	// stream ID the server will accept on this connection.
+	drainOnce     sync.Once
+	drainObserved chan struct{}
+	drainBound    uint32
+	peerDrain     atomic.Bool
 }
 
 // ClientOpts configures a client
@@ -68,6 +79,21 @@ func WithOnClose(onClose func()) ClientOpts {
 func WithUnaryClientInterceptor(i UnaryClientInterceptor) ClientOpts {
 	return func(c *Client) {
 		c.interceptor = i
+	}
+}
+
+// WithClientGracefulDrain enables the optional connection-level graceful drain
+// protocol on the client. When enabled, the client advertises drain support
+// to the server during the control-frame handshake; new calls whose stream IDs
+// are past a server-advertised drain boundary then fail with
+// ErrConnectionDraining instead of relying on connection closure timing.
+//
+// Against a server that does not support the protocol the connection behaves
+// exactly as before: its Hello control frame is ignored and no drain frames
+// are ever received.
+func WithClientGracefulDrain() ClientOpts {
+	return func(c *Client) {
+		c.gracefulDrain = true
 	}
 }
 
@@ -121,6 +147,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+		drainObserved:   make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -129,6 +156,19 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 
 	if c.interceptor == nil {
 		c.interceptor = defaultClientInterceptor
+	}
+
+	// The Hello frame is the first frame on the connection, sent before the
+	// receive loop starts. The send lock also serializes stream creation, so
+	// no request frame can be reordered ahead of the handshake. A peer that
+	// does not understand control frames simply ignores it. Failure here
+	// poisons the connection; the receive loop picks up the closed conn.
+	if c.gracefulDrain {
+		if err := c.send(controlStreamID, messageTypeControl, 0,
+			encodeControlHello(controlFeatureGracefulDrain)); err != nil {
+			go c.run()
+			return c
+		}
 	}
 
 	go c.run()
@@ -367,6 +407,17 @@ func (c *Client) receiveLoop() error {
 				}
 			}
 			sid := streamID(msg.header.StreamID)
+			if msg.header.Type == messageTypeControl {
+				if uint32(sid) == controlStreamID {
+					if c.gracefulDrain {
+						c.handleControl(msg.payload)
+					}
+					c.channel.putmbuf(msg.payload)
+				} else {
+					log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received control frame on RPC stream")
+				}
+				continue
+			}
 			s := c.getStream(sid)
 			if s == nil {
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
@@ -381,6 +432,69 @@ func (c *Client) receiveLoop() error {
 				}
 			}
 		}
+	}
+}
+
+// isDraining reports whether a new stream with the given id would be past the
+// server-advertised drain boundary for this connection.
+func (c *Client) isDraining(id streamID) bool {
+	select {
+	case <-c.drainObserved:
+		return uint32(id) > atomic.LoadUint32(&c.drainBound)
+	default:
+		return false
+	}
+}
+
+// drainBoundary returns the current last accepted stream ID and whether a
+// drain boundary has been observed.
+func (c *Client) drainBoundary() (uint32, bool) {
+	select {
+	case <-c.drainObserved:
+		return atomic.LoadUint32(&c.drainBound), true
+	default:
+		return 0, false
+	}
+}
+
+// setDrainBoundary records an advertised drain boundary. The boundary only
+// moves forward for the lifetime of a connection, so delayed or duplicate
+// frames can never move it backwards.
+func (c *Client) setDrainBoundary(lastStreamID uint32) {
+	for {
+		cur, observed := c.drainBoundary()
+		if observed && lastStreamID <= cur {
+			return
+		}
+		if atomic.CompareAndSwapUint32(&c.drainBound, cur, lastStreamID) {
+			if !observed {
+				c.drainOnce.Do(func() { close(c.drainObserved) })
+			}
+			return
+		}
+	}
+}
+
+// handleControl processes a connection-scoped control frame. Unknown kinds
+// and malformed payloads are ignored so newer peers cannot crash this client.
+func (c *Client) handleControl(p []byte) {
+	kind, fields, err := decodeControlPayload(p)
+	if err != nil {
+		log.G(c.ctx).WithError(err).Debug("ttrpc: ignoring control frame")
+		return
+	}
+	switch kind {
+	case controlHelloKind:
+		features := controlFeature(fields[controlFieldU32])
+		if features&controlFeatureGracefulDrain == controlFeatureGracefulDrain {
+			c.peerDrain.CompareAndSwap(false, true)
+		}
+	case controlDrainKind:
+		if !c.peerDrain.Load() {
+			log.G(c.ctx).Debug("ttrpc: ignoring drain frame from peer without drain capability")
+			return
+		}
+		c.setDrainBoundary(fields[controlFieldU32])
 	}
 }
 
@@ -401,6 +515,12 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	case <-c.ctx.Done():
 		return nil, ErrClosed
 	default:
+	}
+
+	// A drain boundary only applies to stream IDs allocated after it was
+	// advertised. Streams created before the boundary completes normally.
+	if c.isDraining(c.nextStreamID) {
+		return nil, ErrConnectionDraining
 	}
 
 	var s *stream

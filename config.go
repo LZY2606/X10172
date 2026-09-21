@@ -22,8 +22,9 @@ import (
 )
 
 type serverConfig struct {
-	handshaker  Handshaker
-	interceptor UnaryServerInterceptor
+	handshaker    Handshaker
+	interceptor   UnaryServerInterceptor
+	gracefulDrain bool
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -39,6 +40,21 @@ func WithServerHandshaker(handshaker Handshaker) ServerOpt {
 			return errors.New("only one handshaker allowed per server")
 		}
 		c.handshaker = handshaker
+		return nil
+	}
+}
+
+// WithServerGracefulDrain enables the connection-level graceful drain protocol on
+// the server. When enabled (and the peer client also supports it),
+// Server.Shutdown and Server.Drain announce a per-connection last accepted
+// stream ID before refusing new RPCs, allowing clients to distinguish calls
+// rejected due to maintenance from ordinary connection failures.
+//
+// When omitted, the server behaves exactly as before and never sends control
+// frames, preserving interoperability with older clients.
+func WithServerGracefulDrain() ServerOpt {
+	return func(c *serverConfig) error {
+		c.gracefulDrain = true
 		return nil
 	}
 }
