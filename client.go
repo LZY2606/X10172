@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -43,6 +44,17 @@ type Client struct {
 	streams      map[streamID]*stream
 	nextStreamID streamID
 	sendLock     sync.Mutex
+
+	// drainEnabled negotiates the graceful drain capability with the server.
+	drainEnabled bool
+	// drainBoundary holds the server announced last accepted stream id. A
+	// value of 0 means no Drain control message has been observed. It is
+	// monotonic within a connection.
+	drainBoundary atomic.Uint32
+	// drainObserved is closed when the first Drain control message is
+	// processed.
+	drainObserved chan struct{}
+	drainOnce     sync.Once
 
 	ctx    context.Context
 	closed func()
@@ -121,6 +133,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+		drainObserved:   make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -132,7 +145,35 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 	}
 
 	go c.run()
+	if c.drainEnabled {
+		// Advertise capabilities before the first request. This runs
+		// concurrently with the receive loop so a synchronous transport
+		// (net.Pipe) does not deadlock when both peers send first. sendLock
+		// serializes the hello with later request/data writes.
+		go c.sendHello()
+	}
 	return c
+}
+
+func (c *Client) sendHello() {
+	hello := marshalControlMessage(controlCapabilities(capabilityGracefulDrain))
+	c.sendLock.Lock()
+	defer c.sendLock.Unlock()
+	select {
+	case <-c.ctx.Done():
+		return
+	default:
+	}
+	if err := c.channel.send(controlStreamID, messageTypeControl, 0, hello); err != nil {
+		log.G(c.ctx).WithError(err).Debug("ttrpc: failed sending control hello")
+	}
+}
+
+// DrainObserved returns a channel that is closed once the server has
+// announced a graceful drain boundary on this connection. It is available
+// only when the client was created with WithGracefulDrain.
+func (c *Client) DrainObserved() <-chan struct{} {
+	return c.drainObserved
 }
 
 func (c *Client) send(sid uint32, mt messageType, flags uint8, b []byte) error {
@@ -367,6 +408,23 @@ func (c *Client) receiveLoop() error {
 				}
 			}
 			sid := streamID(msg.header.StreamID)
+			if msg.header.Type == messageTypeControl {
+				if msg.header.StreamID != controlStreamID || msg.header.Flags != 0 {
+					// Unknown or malformed connection control frame; ignore
+					// for forward compatibility.
+					if msg.payload != nil {
+						c.channel.putmbuf(msg.payload)
+					}
+					continue
+				}
+				if cm, ok := parseControlMessage(msg.payload); ok && c.drainEnabled {
+					c.handleControl(cm)
+				}
+				if msg.payload != nil {
+					c.channel.putmbuf(msg.payload)
+				}
+				continue
+			}
 			s := c.getStream(sid)
 			if s == nil {
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
@@ -394,6 +452,13 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	// and just use sendLock to guard writing to the wire, but for now it seems simpler to have fewer mutexes.
 	c.sendLock.Lock()
 	defer c.sendLock.Unlock()
+
+	// Reject new streams that would be allocated beyond the server announced
+	// drain boundary. The decision is stable and does not depend on the
+	// connection closing.
+	if boundary := c.drainBoundary.Load(); boundary != 0 && uint32(c.nextStreamID) > boundary {
+		return nil, newDrainingStatus(boundary).Err()
+	}
 
 	// Check if closed since lock acquired to prevent adding
 	// anything after cleanup completes
@@ -454,6 +519,30 @@ func (c *Client) cleanupStreams(err error) {
 	for sid, s := range c.streams {
 		s.closeWithError(err)
 		delete(c.streams, sid)
+	}
+}
+
+// handleControl processes connection scoped control messages. Drain
+// boundaries are accepted only when they do not move backwards.
+func (c *Client) handleControl(cm controlMessage) {
+	switch cm.kind {
+	case controlMessageHello:
+		// Server capability advertisement; the client gate is the server
+		// sending a Drain message, nothing to record.
+	case controlMessageDrain:
+		for {
+			old := c.drainBoundary.Load()
+			boundary := cm.uint32Value()
+			if boundary < old {
+				// Delayed or replayed frame must never roll the boundary
+				// backwards.
+				return
+			}
+			if c.drainBoundary.CompareAndSwap(old, boundary) {
+				c.drainOnce.Do(func() { close(c.drainObserved) })
+				return
+			}
+		}
 	}
 }
 

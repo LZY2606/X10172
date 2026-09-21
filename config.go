@@ -22,8 +22,9 @@ import (
 )
 
 type serverConfig struct {
-	handshaker  Handshaker
-	interceptor UnaryServerInterceptor
+	handshaker       Handshaker
+	interceptor      UnaryServerInterceptor
+	gracefulShutdown bool
 }
 
 // ServerOpt for configuring a ttrpc server

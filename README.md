@@ -23,6 +23,16 @@ GRPC services, as they do not speak the same protocol.
 
 See the [protocol specification](./PROTOCOL.md).
 
+## Graceful drain
+
+Servers built with `WithGracefulShutdown` and clients built with
+`WithGracefulDrain` negotiate an optional connection-scoped graceful drain.
+During `Server.ShutdownGraceful`, the server announces the last accepted
+client stream id on each negotiated connection: earlier calls complete while
+later calls fail with a stable `codes.Unavailable` result matched by
+`IsServerDraining`, without closing the connection. Peers that do not
+negotiate the capability keep the pre-existing shutdown behavior.
+
 # Usage
 
 It's recommended to use [`protobuild`](https://github.com/containerd/protobuild)

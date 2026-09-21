@@ -56,6 +56,7 @@ initiated streams. Server initiated streams are not currently supported.
 | 0x01         | Request  | Initiates stream                 |
 | 0x02         | Response | Final stream data and terminates |
 | 0x03         | Data     | Stream data                      |
+| 0x04         | Control  | Connection scoped control frame  |
 
 ### Request
 
@@ -109,6 +110,62 @@ considered data and should be processed.
 |------|-----------------|-----------------------------------|
 | 0x01 | `remote closed` | No more data expected from remote |
 | 0x04 | `no data`       | This message does not have data   |
+
+### Control
+
+Control messages are connection scoped, never associated with an RPC. They
+always use stream id `0`, carry no flags and have a fixed 5 byte payload:
+
+    +------------------+-------------------------------------------+
+    | Control Msg (8)  |                Value (32)                 |
+    +------------------+-------------------------------------------+
+
+| Control Msg | Name  | Value                                       |
+|-------------|-------|---------------------------------------------|
+| 0x01        | Hello | Bitmask of capabilities supported by peer   |
+| 0x02        | Drain | Last accepted client initiated stream id    |
+
+Control frames are an optional extension. A peer that does not understand
+message type `0x04` must ignore it for forward compatibility; because stream
+id `0` never identifies an RPC, it must never be routed to a stream. Peers
+MUST ignore malformed control frames, unknown control messages, control
+frames with a non-zero stream id or non-zero flags.
+
+#### Capability negotiation
+
+The graceful drain capability (`0x01`) is negotiated explicitly. Both peers
+MAY send a `Hello` control frame immediately after the connection (and any
+configured handshake) is established, before the first request:
+
+*   A server only sends `Drain` after it received the peer's `Hello` with the
+    graceful drain bit set and was built with drain support enabled.
+*   A client only processes `Drain` when it advertised the capability.
+
+Peers which never send `Hello` keep working with the pre-1.3 semantics: the
+other side never sends `Drain` and connection shutdown behaves exactly as
+before. Repeated `Hello` frames are harmless and carry no state.
+
+#### Stream id boundary and error mapping
+
+When a server enters maintenance it sends a single `Drain` frame whose value
+is the highest client stream id accepted on that connection at that point
+(the "last stream id"). The value is monotonic within a connection: a later
+`Drain` MUST NOT move the boundary backwards, and receivers MUST ignore
+frames that would. A reconnect is a new connection with its own boundary.
+
+Semantics:
+
+*   Streams with id less than or equal to the boundary that were already
+    accepted run to completion; client half-close, server half-close and the
+    final response/data keep their original ordering.
+*   New requests with a greater stream id are rejected with a gRPC status of
+    `UNAVAILABLE` and a message prefixed
+    `ttrpc: server is draining the connection`. Clients which negotiated the
+    capability may fail such calls locally with the same stable result, and
+    expose a matcher (`IsServerDraining`) instead of relying on the
+    connection being closed.
+*   Data frames for an unknown stream after the boundary map to the same
+    `UNAVAILABLE` status.
 
 ## Streaming
 
@@ -238,3 +295,4 @@ routing by procedure name and a response type which supports call status.
 |---------|---------------------|
 | 1.0     | Unary requests only |
 | 1.2     | Streaming support   |
+| 1.3     | Graceful drain control frames |
