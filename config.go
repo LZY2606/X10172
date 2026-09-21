@@ -22,8 +22,9 @@ import (
 )
 
 type serverConfig struct {
-	handshaker  Handshaker
-	interceptor UnaryServerInterceptor
+	handshaker   Handshaker
+	interceptor  UnaryServerInterceptor
+	drainSupport bool
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -39,6 +40,19 @@ func WithServerHandshaker(handshaker Handshaker) ServerOpt {
 			return errors.New("only one handshaker allowed per server")
 		}
 		c.handshaker = handshaker
+		return nil
+	}
+}
+
+// WithServerDrainSupport opts the server into the graceful connection drain
+// protocol extension. The server acknowledges drain capable clients and
+// announces the last accepted stream ID on each connection when Server.Drain
+// is called. Clients which do not support the extension are unaffected:
+// requests beyond the drain boundary are rejected with a normal response
+// carrying a codes.Unavailable status.
+func WithServerDrainSupport() ServerOpt {
+	return func(c *serverConfig) error {
+		c.drainSupport = true
 		return nil
 	}
 }
