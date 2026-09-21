@@ -18,12 +18,14 @@ package ttrpc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -51,6 +53,11 @@ type Client struct {
 	userCloseFunc   func()
 	userCloseWaitCh chan struct{}
 
+	drainSupported bool
+	drainOnce      sync.Once
+	drainCh        chan struct{}
+	drainBoundary  atomic.Uint32
+
 	interceptor UnaryClientInterceptor
 }
 
@@ -68,6 +75,18 @@ func WithOnClose(onClose func()) ClientOpts {
 func WithUnaryClientInterceptor(i UnaryClientInterceptor) ClientOpts {
 	return func(c *Client) {
 		c.interceptor = i
+	}
+}
+
+// WithClientDrainSupport enables the connection drain protocol on the
+// client. The client announces drain capability to the server during
+// connection setup. When a draining server announces its drain boundary,
+// calls already accepted by the server complete normally while new calls
+// fail with ErrDraining instead of racing a connection close. Clients
+// without this option neither send nor act on control frames.
+func WithClientDrainSupport() ClientOpts {
+	return func(c *Client) {
+		c.drainSupported = true
 	}
 }
 
@@ -121,6 +140,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+		drainCh:         make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -131,6 +151,13 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		c.interceptor = defaultClientInterceptor
 	}
 
+	if c.drainSupported {
+		// Announce drain capability before any stream is created. If the
+		// server does not understand control frames it ignores them; the
+		// failure of this send is handled by the receive loop.
+		_ = c.sendControl(encodeControlCapability(capabilityDrain))
+	}
+
 	go c.run()
 	return c
 }
@@ -139,6 +166,56 @@ func (c *Client) send(sid uint32, mt messageType, flags uint8, b []byte) error {
 	c.sendLock.Lock()
 	defer c.sendLock.Unlock()
 	return c.channel.send(sid, mt, flags, b)
+}
+
+// sendControl writes a connection-level control frame on stream id 0.
+func (c *Client) sendControl(p []byte) error {
+	c.sendLock.Lock()
+	defer c.sendLock.Unlock()
+	return c.channel.send(0, messageTypeControl, 0, p)
+}
+
+// Draining reports whether the server has announced a connection drain.
+// Once Draining returns true, new calls fail with ErrDraining.
+func (c *Client) Draining() bool {
+	select {
+	case <-c.drainCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// handleControl processes a connection-level control frame. Unknown or
+// malformed frames are ignored for forward compatibility.
+func (c *Client) handleControl(p []byte) {
+	if p != nil {
+		defer c.channel.putmbuf(p)
+	}
+	kind, body, err := decodeControl(p)
+	if err != nil {
+		return
+	}
+	switch kind {
+	case controlKindDrain:
+		if !c.drainSupported || len(body) < 4 {
+			return
+		}
+		boundary := binary.BigEndian.Uint32(body)
+		// The boundary is monotonic per connection: delayed or
+		// duplicated drain frames must never move it backwards.
+		for {
+			cur := c.drainBoundary.Load()
+			if cur >= boundary || c.drainBoundary.CompareAndSwap(cur, boundary) {
+				break
+			}
+		}
+		c.drainOnce.Do(func() {
+			close(c.drainCh)
+		})
+	default:
+		// Ignore capability announcements and unknown control kinds.
+	}
 }
 
 // Call makes a unary request and returns with response
@@ -179,6 +256,9 @@ func (c *Client) Call(ctx context.Context, service, method string, req, resp any
 	}
 
 	if cresp.Status != nil && cresp.Status.Code != int32(codes.OK) {
+		if isDrainStatus(cresp.Status.Code, cresp.Status.Message) {
+			return ErrDraining
+		}
 		return status.ErrorProto(cresp.Status)
 	}
 	return nil
@@ -283,6 +363,9 @@ func (cs *clientStream) RecvMsg(m any) error {
 		}
 
 		if resp.Status != nil && resp.Status.Code != int32(codes.OK) {
+			if isDrainStatus(resp.Status.Code, resp.Status.Message) {
+				return ErrDraining
+			}
 			return status.ErrorProto(resp.Status)
 		}
 
@@ -366,6 +449,10 @@ func (c *Client) receiveLoop() error {
 					return filterCloseErr(err)
 				}
 			}
+			if err == nil && msg.header.Type == messageTypeControl {
+				c.handleControl(msg.payload)
+				continue
+			}
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
@@ -400,6 +487,15 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	select {
 	case <-c.ctx.Done():
 		return nil, ErrClosed
+	default:
+	}
+
+	// Reject new streams once the server has announced a drain. Any stream
+	// id allocated now is past the server's drain boundary, so fail fast
+	// with a stable error instead of racing the connection close.
+	select {
+	case <-c.drainCh:
+		return nil, ErrDraining
 	default:
 	}
 

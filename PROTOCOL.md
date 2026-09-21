@@ -56,6 +56,73 @@ initiated streams. Server initiated streams are not currently supported.
 | 0x01         | Request  | Initiates stream                 |
 | 0x02         | Response | Final stream data and terminates |
 | 0x03         | Data     | Stream data                      |
+| 0x04         | Control  | Connection-level control frame   |
+
+### Control
+
+The control message carries connection-level protocol extensions. Control
+messages must be sent with Stream ID 0 and empty flags. Implementations that
+do not recognize the control message type must ignore these frames; they must
+not treat them as stream messages or terminate the connection.
+
+The payload of a control message starts with a 1-byte kind followed by a
+kind-specific body:
+
+    +---------------------------------------------------------------+
+    |                         Kind (8)                              |
+    +---------------------------------------------------------------+
+    |                           Body (*)                            |
+    +---------------------------------------------------------------+
+
+| Kind | Name         | Description                              |
+|------|--------------|------------------------------------------|
+| 0x01 | `capability` | Announces sender capabilities            |
+| 0x02 | `drain`      | Announces a connection drain boundary    |
+
+Receivers must ignore control frames with unknown kinds and control frames
+with malformed bodies.
+
+#### Capability
+
+The capability body is a single byte bitmask:
+
+| Bit  | Name    | Description                          |
+|------|---------|--------------------------------------|
+| 0x01 | `drain` | Sender supports the drain protocol   |
+
+A client which supports graceful connection drain sends a capability frame
+with the `drain` bit set immediately after the connection is established,
+before any request. A drain-capable server replies with its own capability
+frame once it receives the client's announcement. A server must only send
+control frames to a client which has announced the `drain` capability.
+
+#### Drain
+
+The drain body is the 4-byte big-endian stream id of the last client
+initiated stream the server accepted before draining:
+
+    +---------------------------------------------------------------+
+    |                     Last Stream ID (32)                       |
+    +---------------------------------------------------------------+
+
+A server sends at most one drain frame per connection, after capability
+negotiation, when it begins draining the connection (for example when
+entering a maintenance window). The announced boundary is fixed for the
+lifetime of the connection and never moves backwards.
+
+Streams with ids less than or equal to the boundary were already received
+by the server and are allowed to complete normally, including their usual
+half-close and final status sequence. The server rejects any request with a
+stream id greater than the boundary with a response status of
+`UNAVAILABLE` and the message `ttrpc: server is draining`. This rejection
+is stable: it does not depend on connection close timing and clients may
+map it to a well-known error (`ErrDraining` in the Go implementation).
+
+Once all streams at or below the boundary have finished, the server closes
+the connection. A drain-capable client rejects new streams locally with
+`ErrDraining` as soon as it has processed a drain frame, and must keep the
+announced boundary monotonic: delayed or duplicated drain frames with a
+lower or equal boundary must be ignored.
 
 ### Request
 

@@ -41,6 +41,7 @@ type Server struct {
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
 	done        chan struct{}            // marks point at which we stop serving requests
+	draining    bool                     // marks point at which connections are drained
 }
 
 func NewServer(opts ...ServerOpt) (*Server, error) {
@@ -174,6 +175,48 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return lnerr
 }
 
+// Drain gracefully drains all current and future connections to the server.
+//
+// For each connection, the server publishes the stream id of the last
+// request it has accepted. Requests already received at or below that
+// boundary are allowed to complete; any new request past the boundary is
+// rejected with a stable Unavailable status which drain-capable clients
+// observe as ErrDraining. Once a connection has no outstanding requests it
+// is closed. Drain blocks until every connection has finished or ctx is
+// cancelled.
+//
+// Drain is idempotent and safe to call concurrently with Shutdown: the
+// drain boundary of a connection is fixed the first time drain takes
+// effect and never moves backwards. Connections accepted after Drain has
+// started are drained immediately.
+func (s *Server) Drain(ctx context.Context) error {
+	s.mu.Lock()
+	s.draining = true
+	conns := make([]*serverConn, 0, len(s.connections))
+	for c := range s.connections {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+
+	for _, c := range conns {
+		c.drain()
+	}
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.countConnection() == 0 {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // Close the server without waiting for active connections.
 func (s *Server) Close() error {
 	s.mu.Lock()
@@ -232,6 +275,11 @@ func (s *Server) addConnection(c *serverConn) error {
 	}
 
 	s.connections[c] = struct{}{}
+	if s.draining {
+		// Connections accepted after drain started are born drained:
+		// their boundary is empty and every request is rejected.
+		c.drain()
+	}
 	return nil
 }
 
@@ -289,6 +337,8 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		conn:      conn,
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
+		drainCh:   make(chan struct{}),
+		controls:  make(chan []byte, 4),
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
@@ -306,6 +356,33 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	lastStreamID atomic.Uint32 // highest client initiated stream id received
+
+	drainOnce sync.Once
+	drainCh   chan struct{}  // closed once drain takes effect on this connection
+	boundary  atomic.Uint32  // last accepted stream id, valid once drainCh is closed
+	controls  chan []byte    // outbound control frames queued for the run loop
+	peerDrain atomic.Bool    // peer announced drain capability
+}
+
+// drain initiates a graceful drain of the connection. The drain boundary is
+// fixed to the highest stream id received so far and never moves afterwards,
+// making repeated calls idempotent.
+func (c *serverConn) drain() {
+	c.drainOnce.Do(func() {
+		c.boundary.Store(c.lastStreamID.Load())
+		close(c.drainCh)
+	})
+}
+
+func (c *serverConn) isDraining() bool {
+	select {
+	case <-c.drainCh:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -345,7 +422,7 @@ func (c *serverConn) run(sctx context.Context) {
 		done                   = make(chan struct{})
 		streams                = sync.Map{}
 		active       int32
-		lastStreamID uint32
+		drainNotify            = c.drainCh
 	)
 
 	defer c.conn.Close()
@@ -399,6 +476,26 @@ func (c *serverConn) run(sctx context.Context) {
 				continue
 			}
 
+			if mh.Type == messageTypeControl {
+				// Connection-level control frames live on stream id 0 and
+				// are handled out of band. Unknown kinds are ignored for
+				// forward compatibility.
+				kind, body, err := decodeControl(p)
+				if p != nil {
+					ch.putmbuf(p)
+				}
+				if err == nil && kind == controlKindCapability && len(body) >= 1 && body[0]&capabilityDrain != 0 {
+					c.peerDrain.Store(true)
+					if c.server.config.drain {
+						select {
+						case c.controls <- encodeControlCapability(capabilityDrain):
+						default:
+						}
+					}
+				}
+				continue
+			}
+
 			if mh.StreamID%2 != 1 {
 				// enforce odd client initiated identifiers.
 				if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID must be odd for client initiated streams")) {
@@ -441,7 +538,7 @@ func (c *serverConn) run(sctx context.Context) {
 					}
 				}
 			} else if mh.Type == messageTypeRequest {
-				if mh.StreamID <= lastStreamID {
+				if mh.StreamID <= c.lastStreamID.Load() {
 					// enforce odd client initiated identifiers.
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID cannot be re-used and must increment")) {
 						return
@@ -449,7 +546,17 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 
 				}
-				lastStreamID = mh.StreamID
+				c.lastStreamID.Store(mh.StreamID)
+
+				if c.isDraining() && mh.StreamID > c.boundary.Load() {
+					// The request arrived after the drain boundary: reject
+					// it with a stable status instead of dropping the
+					// connection, so the client does not have to guess.
+					if !sendStatus(mh.StreamID, status.New(codes.Unavailable, drainStatusMessage)) {
+						return
+					}
+					continue
+				}
 
 				// TODO: Make request type configurable
 				// Unmarshaller which takes in a byte array and returns an interface?
@@ -512,8 +619,27 @@ func (c *serverConn) run(sctx context.Context) {
 			c.setState(newstate)
 			state = newstate
 		}
+		if newstate == connStateIdle && c.isDraining() {
+			// The connection is drained and has no outstanding requests:
+			// close it so the peer observes a clean end of the drain.
+			return
+		}
 
 		select {
+		case cf := <-c.controls:
+			if err := ch.send(0, messageTypeControl, 0, cf); err != nil {
+				log.G(ctx).WithError(err).Error("failed sending control frame")
+				return
+			}
+		case <-drainNotify:
+			// Publish the drain boundary to capable peers exactly once.
+			if c.peerDrain.Load() {
+				if err := ch.send(0, messageTypeControl, 0, encodeControlDrain(c.boundary.Load())); err != nil {
+					log.G(ctx).WithError(err).Error("failed sending drain control frame")
+					return
+				}
+			}
+			drainNotify = nil
 		case response := <-responses:
 			if !response.streaming || response.status.Code() != codes.OK {
 				p, err := c.server.codec.Marshal(&Response{
