@@ -27,3 +27,38 @@ message KeyValue {
 	string key = 1;
 	string value = 2;
 }
+
+// ControlMessage is the payload of a connection-level Control frame
+// (message type 0x04, stream ID 0). It negotiates optional protocol
+// extensions and carries connection-scoped control signals that are not
+// associated with any RPC stream. Peers that do not recognize Control
+// frames must ignore them (see PROTOCOL.md, version 1.3).
+message ControlMessage {
+	oneof message {
+		// Settings announces the connection-level features supported by
+		// the sender. A peer sends Settings at most once, immediately
+		// after connection establishment and before any RPC frames.
+		Settings settings = 1;
+
+		// Drain is sent by a server to announce a graceful drain
+		// boundary on the connection.
+		Drain drain = 2;
+	}
+}
+
+// Settings lists optional protocol features supported by the sender.
+// Feature names use a stable reverse-DNS style identifier. Absence of a
+// feature means the peer must not rely on it.
+message Settings {
+	repeated string features = 1;
+}
+
+// Drain announces that the server will no longer accept new RPC streams
+// whose stream ID is greater than last_stream_id on this connection.
+// Streams with IDs less than or equal to last_stream_id that were already
+// received are allowed to complete. A Drain frame with a smaller
+// last_stream_id than a previously observed one must be ignored so the
+// boundary is monotonic.
+message Drain {
+	uint32 last_stream_id = 1;
+}
