@@ -22,8 +22,9 @@ import (
 )
 
 type serverConfig struct {
-	handshaker  Handshaker
-	interceptor UnaryServerInterceptor
+	handshaker    Handshaker
+	interceptor   UnaryServerInterceptor
+	gracefulDrain bool
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -71,6 +72,20 @@ func WithChainUnaryServerInterceptor(interceptors ...UnaryServerInterceptor) Ser
 			return interceptors[0](ctx, unmarshal, info,
 				chainUnaryServerInterceptors(info, method, interceptors[1:]))
 		}
+		return nil
+	}
+}
+
+// WithGracefulDrain enables the optional graceful drain extension on the
+// server. When enabled, the server participates in SETTINGS capability
+// negotiation on each connection and Server.Drain announces a per-connection
+// stream id boundary instead of relying on connection closure to shed load.
+//
+// It has no effect on clients or peers that do not enable the feature: the
+// wire format and default shutdown behavior are unchanged.
+func WithGracefulDrain() ServerOpt {
+	return func(c *serverConfig) error {
+		c.gracefulDrain = true
 		return nil
 	}
 }

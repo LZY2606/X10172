@@ -56,6 +56,7 @@ initiated streams. Server initiated streams are not currently supported.
 | 0x01         | Request  | Initiates stream                 |
 | 0x02         | Response | Final stream data and terminates |
 | 0x03         | Data     | Stream data                      |
+| 0x04         | Control  | Connection-scoped control frame  |
 
 ### Request
 
@@ -109,6 +110,82 @@ considered data and should be processed.
 |------|-----------------|-----------------------------------|
 | 0x01 | `remote closed` | No more data expected from remote |
 | 0x04 | `no data`       | This message does not have data   |
+
+### Control
+
+Control messages are connection-scoped frames that never carry RPC traffic.
+They are always sent on stream id `0`, which never collides with the odd
+client initiated stream ids. A Control frame uses message type `0x04` and its
+data is a protobuf `Control` message:
+
+    message Control {
+      enum Type { SETTINGS = 1; DRAIN = 2; }
+      Type type = 1;
+      message SettingsEntry { string name = 1; string value = 2; }
+      repeated SettingsEntry settings = 2;
+      uint32 last_stream_id = 3;
+    }
+
+Unknown control types, unknown settings entries, and malformed control
+payloads must be ignored rather than treated as RPCs or poisoning the
+connection. Frames of any other message type on stream id `0` must also be
+ignored. This keeps the extension interoperable with peers that do not
+implement it.
+
+#### Capability Negotiation
+
+The graceful drain extension is optional and off by default; no control
+frames are sent unless both sides opt in.
+
+After a connection is established, an opting-in client sends a `SETTINGS`
+control frame advertising the feature:
+
+    settings: [{ name: "graceful-drain", value: "1" }]
+
+An opting-in server that receives this frame records the peer capability and
+replies with its own `SETTINGS` frame carrying the same entry. A server that
+has not enabled graceful drain, and a client that has not enabled it, simply
+never send or act on these frames. The negotiation is purely additive and
+does not change the wire format of Request, Response, or Data frames.
+
+#### DRAIN Boundary
+
+Once capability negotiation has succeeded, a server entering maintenance may
+send at most one effective `DRAIN` control frame per connection:
+
+    { type: DRAIN, last_stream_id: N }
+
+`last_stream_id` is the high water mark of client stream ids the server had
+accepted at the moment the boundary was taken. The boundary is monotonic for
+the lifetime of the connection: duplicate frames or a delayed frame carrying a
+smaller value must not move it backwards, and a new connection starts with no
+boundary.
+
+Semantics:
+
+* Every request with a stream id less than or equal to `N` that the server
+  had already accepted is allowed to run to completion with its normal
+  half-close and final status ordering.
+* Every new request with a stream id greater than `N` is rejected without
+  being dispatched. A capable client rejects such calls locally once it has
+  observed the boundary, so it does not rely on connection closure timing.
+* The server waits for all accepted streams to finish before considering the
+  connection drained, then closes the idle connection.
+
+#### Error Mapping
+
+A rejected request (whether refused by the server over the wire or held back
+locally by a capable client) is surfaced as a stable, identifiable error:
+
+* gRPC status code: `UNAVAILABLE` (14).
+* A `google.rpc.ErrorInfo` status detail with `domain` set to `"ttrpc"` and
+  `reason` set to `"CONNECTION_DRAINING"`; the detail metadata includes
+  `last_stream_id`.
+
+Callers identify the condition without matching message text. In the Go
+implementation this is the `ErrConnectionDraining` sentinel (usable with
+`errors.Is`) and the `IsDraining(err)` helper. Against a peer that does not
+support the extension, no DRAIN frame is ever sent and behavior is unchanged.
 
 ## Streaming
 
@@ -238,3 +315,4 @@ routing by procedure name and a response type which supports call status.
 |---------|---------------------|
 | 1.0     | Unary requests only |
 | 1.2     | Streaming support   |
+| 1.3     | Control frames and optional graceful drain |

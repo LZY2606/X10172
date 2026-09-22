@@ -52,6 +52,21 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+
+	// gracefulDrain enables the SETTINGS advertisement and local boundary
+	// enforcement. It is immutable after NewClient returns.
+	gracefulDrain bool
+
+	// drainMu guards drainCh and peerDrain.
+	drainMu sync.Mutex
+	// peerDrain records that the server advertised the graceful drain
+	// feature in its SETTINGS frame.
+	peerDrain bool
+	// drainCh is closed the first time a DRAIN frame is observed.
+	drainCh chan struct{}
+	// drainBoundary holds the monotonic last accepted stream id announced
+	// by the server.
+	drainBoundary drainBoundary
 }
 
 // ClientOpts configures a client
@@ -93,6 +108,19 @@ func WithChainUnaryClientInterceptor(interceptors ...UnaryClientInterceptor) Cli
 	}
 }
 
+// WithClientGracefulDrain enables the optional graceful drain extension on the
+// client. The client advertises the capability to the server after the
+// connection is established; once the server acknowledges it, the client
+// honors any drain boundary the server later announces.
+//
+// When disabled (the default), no control frames are sent and the client
+// behaves exactly as before, including against peers that use the extension.
+func WithClientGracefulDrain() ClientOpts {
+	return func(c *Client) {
+		c.gracefulDrain = true
+	}
+}
+
 func chainUnaryInterceptors(interceptors []UnaryClientInterceptor, final Invoker, info *UnaryClientInfo) Invoker {
 	if len(interceptors) == 0 {
 		return final
@@ -121,6 +149,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+		drainCh:         make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -129,6 +158,17 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 
 	if c.interceptor == nil {
 		c.interceptor = defaultClientInterceptor
+	}
+
+	if c.gracefulDrain {
+		// The SETTINGS frame is sent before the receive loop starts, so it
+		// is the first frame on the wire. A failure here means the
+		// connection is unusable; the receive loop will observe the dead
+		// connection and tear the client down as usual.
+		if err := c.send(controlStreamID, messageTypeControl, 0,
+			marshalSettingsControl(featureGracefulDrain)); err != nil {
+			log.G(ctx).WithError(err).Error("ttrpc: failed to advertise graceful drain settings")
+		}
 	}
 
 	go c.run()
@@ -179,7 +219,7 @@ func (c *Client) Call(ctx context.Context, service, method string, req, resp any
 	}
 
 	if cresp.Status != nil && cresp.Status.Code != int32(codes.OK) {
-		return status.ErrorProto(cresp.Status)
+		return clientResponseError(cresp.Status)
 	}
 	return nil
 }
@@ -283,7 +323,7 @@ func (cs *clientStream) RecvMsg(m any) error {
 		}
 
 		if resp.Status != nil && resp.Status.Code != int32(codes.OK) {
-			return status.ErrorProto(resp.Status)
+			return clientResponseError(resp.Status)
 		}
 
 		cs.c.deleteStream(cs.s)
@@ -337,6 +377,34 @@ func (c *Client) UserOnCloseWait(ctx context.Context) error {
 	}
 }
 
+// WaitDrain blocks until the server announces a graceful drain boundary on
+// this connection, the context is cancelled, or the connection closes. It
+// returns nil once a drain boundary has been observed, including boundaries
+// announced before the call.
+//
+// The method is safe to call on a client created without
+// WithClientGracefulDrain, but such a client never observes a drain boundary;
+// in that case WaitDrain only returns when ctx is done or the connection is
+// closed.
+func (c *Client) WaitDrain(ctx context.Context) error {
+	select {
+	case <-c.drainCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return ErrClosed
+	}
+}
+
+// DrainBoundary returns the last stream id accepted by the server for calls
+// on this connection. The boolean is false until a drain boundary has been
+// announced. New client initiated streams with an id greater than the returned
+// value are rejected with ErrConnectionDraining.
+func (c *Client) DrainBoundary() (uint32, bool) {
+	return c.drainBoundary.get()
+}
+
 func (c *Client) run() {
 	err := c.receiveLoop()
 	c.Close()
@@ -369,6 +437,10 @@ func (c *Client) receiveLoop() error {
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
+				if sid == streamID(controlStreamID) {
+					c.handleControlMessage(c.ctx, msg)
+					continue
+				}
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
 				continue
 			}
@@ -381,6 +453,52 @@ func (c *Client) receiveLoop() error {
 				}
 			}
 		}
+	}
+}
+
+// handleControlMessage processes connection-scoped control frames received on
+// stream 0. Unknown control types are ignored so newer peers cannot crash an
+// older client.
+func (c *Client) handleControlMessage(ctx context.Context, msg *streamMessage) {
+	if msg.header.Type != messageTypeControl {
+		return
+	}
+	ctrl, err := unmarshalControl(msg.payload[:msg.header.Length])
+	if msg.payload != nil {
+		c.channel.putmbuf(msg.payload)
+	}
+	if err != nil {
+		log.G(ctx).WithError(err).Error("ttrpc: failed to unmarshal control frame")
+		return
+	}
+
+	switch ctrl.GetType() {
+	case Control_SETTINGS:
+		if !supportsGracefulDrain(ctrl) {
+			return
+		}
+		c.drainMu.Lock()
+		c.peerDrain = true
+		c.drainMu.Unlock()
+	case Control_DRAIN:
+		n := ctrl.GetLastStreamId()
+		// The boundary is monotonic per connection; a duplicate or a
+		// delayed frame with a smaller value must not move it backwards.
+		if !c.drainBoundary.advance(n) {
+			return
+		}
+		c.drainMu.Lock()
+		if !c.peerDrain {
+			// Record capability even if SETTINGS was lost; the DRAIN
+			// frame can only be valid when both sides support draining.
+			c.peerDrain = true
+		}
+		select {
+		case <-c.drainCh:
+		default:
+			close(c.drainCh)
+		}
+		c.drainMu.Unlock()
 	}
 }
 
@@ -415,6 +533,11 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		case <-c.ctx.Done():
 			return ErrClosed
 		default:
+		}
+
+		candidate := c.nextStreamID
+		if n, draining := c.drainBoundary.get(); draining && candidate > streamID(n) {
+			return ErrConnectionDraining
 		}
 
 		s = newStream(c.nextStreamID, c, recvBuf)

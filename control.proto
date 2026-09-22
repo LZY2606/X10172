@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package ttrpc;
+
+option go_package = "github.com/containerd/ttrpc";
+
+// Control is the payload of a connection-scoped Control message frame
+// (message type 0x04) sent on stream id 0. Control frames never carry
+// per-stream traffic. Unknown control types and unknown settings entries
+// must be ignored by implementations so that future extensions remain
+// interoperable with older peers.
+message Control {
+  // Type identifies the control message.
+  enum Type {
+    // UNKNOWN must never be sent on the wire.
+    UNKNOWN = 0;
+
+    // SETTINGS advertises optional connection features supported by the
+    // sender. A peer that does not understand a feature simply never uses
+    // it. The entries carried in settings describe each feature.
+    SETTINGS = 1;
+
+    // DRAIN announces a graceful drain boundary. Only the server sends it,
+    // after both peers negotiated the "graceful-drain" feature through
+    // SETTINGS. Once sent, the server completes every request it has
+    // already accepted and rejects all requests with a stream id greater
+    // than last_stream_id.
+    DRAIN = 2;
+  }
+
+  Type type = 1;
+
+  // SettingsEntry is a single advertised feature.
+  message SettingsEntry {
+    string name = 1;
+    string value = 2;
+  }
+
+  // settings carries the feature list for a SETTINGS control message.
+  repeated SettingsEntry settings = 2;
+
+  // last_stream_id is the highest client-initiated stream id accepted by
+  // the server at the moment the DRAIN boundary was taken. It is only set
+  // for DRAIN control messages and must never move backwards.
+  uint32 last_stream_id = 3;
+}
