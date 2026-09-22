@@ -155,6 +155,55 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	lnerr := s.closeListeners()
 	s.mu.Unlock()
 
+	return s.waitConnections(ctx, lnerr)
+}
+
+// Drain initiates a graceful drain of all connections and waits until
+// they have finished draining, or until ctx is done.
+//
+// Drain stops accepting new connections, like Shutdown. On each
+// connection whose client negotiated the graceful drain capability,
+// the server announces the last accepted client stream ID. Streams at
+// or before that boundary are allowed to complete in their normal
+// order; new calls after the boundary receive a stable Unavailable
+// status (ErrConnectionDraining on capable clients) rather than
+// depending on connection close timing. The connection is closed once
+// every in-flight stream has finished.
+//
+// Connections whose client did not negotiate drain keep the legacy
+// Shutdown behavior: active connections are left alone and idle
+// connections are closed.
+//
+// Drain is idempotent and safe to call concurrently with itself, with
+// Shutdown and with Close. Repeated calls share a single drain and
+// return the same outcome.
+func (s *Server) Drain(ctx context.Context) error {
+	s.mu.Lock()
+	select {
+	case <-s.done:
+	default:
+		close(s.done)
+	}
+	lnerr := s.closeListeners()
+	s.drainConnectionsLocked()
+	s.mu.Unlock()
+
+	return s.waitConnections(ctx, lnerr)
+}
+
+// drainConnectionsLocked asks every registered connection to start
+// draining. Connections added racing with shutdown are rejected by
+// addConnection.
+func (s *Server) drainConnectionsLocked() {
+	for c := range s.connections {
+		c.beginDrain()
+	}
+}
+
+// waitConnections closes idle (legacy) connections and blocks until no
+// tracked connections remain. Drain-announced connections are never
+// force closed while idle so the client always receives the boundary.
+func (s *Server) waitConnections(ctx context.Context, lnerr error) error {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -257,6 +306,13 @@ func (s *Server) closeIdleConns() {
 		if st, ok := c.getState(); !ok || st == connStateActive {
 			continue
 		}
+		if c.isDraining() && !c.legacyPeer() {
+			// Drain-capable connections must not be force closed
+			// while idle: the client has to observe the drain
+			// boundary before the connection goes away. Such a
+			// connection closes itself once its last stream ends.
+			continue
+		}
 		c.close()
 		delete(s.connections, c)
 	}
@@ -289,6 +345,7 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		conn:      conn,
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
+		drainReq:  make(chan struct{}, 1),
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
@@ -306,6 +363,16 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	// drainReq is signaled to ask the receive goroutine to announce a
+	// drain boundary. It is buffered so beginDrain never blocks even if
+	// the connection is already exiting.
+	drainReq chan struct{}
+
+	// draining marks that drain was requested on this connection and
+	// peerDrain that the peer advertised the drain capability.
+	draining  atomic.Bool
+	peerDrain atomic.Bool
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -325,37 +392,73 @@ func (c *serverConn) close() error {
 	return nil
 }
 
-func (c *serverConn) run(sctx context.Context) {
-	type (
-		response struct {
-			id          uint32
-			status      *status.Status
-			data        []byte
-			closeStream bool
-			streaming   bool
-		}
-	)
+// beginDrain asks the connection to announce a drain boundary and stop
+// accepting new streams. It is a no-op after the first request and is
+// safe to invoke any number of times concurrently.
+func (c *serverConn) beginDrain() {
+	if !c.draining.CompareAndSwap(false, true) {
+		return
+	}
+	select {
+	case c.drainReq <- struct{}{}:
+	default:
+	}
+}
 
+func (c *serverConn) isDraining() bool {
+	return c.draining.Load()
+}
+
+func (c *serverConn) legacyPeer() bool {
+	return !c.peerDrain.Load()
+}
+
+// drainComplete reports whether a drain-capable connection has
+// announced its boundary and finished every in-flight call. It is
+// evaluated in the main loop only after the boundary control frame and
+// the terminal responses have been written to the wire.
+func (c *serverConn) drainComplete(active, inFlight int32) bool {
+	return c.isDraining() && c.peerDrain.Load() && active == 0 &&
+		inFlight == 0
+}
+
+func (c *serverConn) run(sctx context.Context) {
 	var (
-		ch                     = newChannel(c.conn)
-		ctx, cancel            = context.WithCancel(sctx)
-		state        connState = connStateIdle
-		responses              = make(chan response)
-		recvErr                = make(chan error, 1)
-		done                   = make(chan struct{})
-		streams                = sync.Map{}
-		active       int32
-		lastStreamID uint32
+		ch                      = newChannel(c.conn)
+		ctx, cancel             = context.WithCancel(sctx)
+		state         connState = connStateIdle
+		responses               = make(chan connResponse)
+		controls                = make(chan []byte)
+		frames                  = make(chan connFrame)
+		recvErr                 = make(chan error, 1)
+		done                    = make(chan struct{})
+		processorDone           = make(chan struct{})
+		streams                 = sync.Map{}
+		active        int32
+		inFlight      int32
+		lastStreamID  uint32
 	)
 
 	defer c.conn.Close()
 	defer cancel()
 	defer close(done)
+	defer func() { <-processorDone }()
 	defer c.server.delConnection(c)
+
+	sendControl := func(p []byte) bool {
+		select {
+		case controls <- p:
+			return true
+		case <-c.shutdown:
+			return false
+		case <-done:
+			return false
+		}
+	}
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
-		case responses <- response{
+		case responses <- connResponse{
 			// even though we've had an invalid stream id, we send it
 			// back on the same stream id so the client knows which
 			// stream id was bad.
@@ -371,8 +474,10 @@ func (c *serverConn) run(sctx context.Context) {
 		}
 	}
 
-	go func(recvErr chan error) {
-		defer close(recvErr)
+	// reader only pulls frames off the wire. All protocol decisions,
+	// including the drain boundary, happen in the processor so that a
+	// frame already read is always ordered before a drain arm.
+	go func() {
 		for {
 			select {
 			case <-c.shutdown:
@@ -384,115 +489,93 @@ func (c *serverConn) run(sctx context.Context) {
 
 			mh, p, err := ch.recv()
 			if err != nil {
-				status, ok := status.FromError(err)
-				if !ok {
-					recvErr <- err
-					return
-				}
-
-				// in this case, we send an error for that particular message
-				// when the status is defined.
-				if !sendStatus(mh.StreamID, status) {
-					return
-				}
-
-				continue
-			}
-
-			if mh.StreamID%2 != 1 {
-				// enforce odd client initiated identifiers.
-				if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID must be odd for client initiated streams")) {
-					return
-				}
-				continue
-			}
-
-			if mh.Type == messageTypeData {
-				i, ok := streams.Load(mh.StreamID)
-				if !ok {
-					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID is no longer active")) {
-						return
-					}
-					continue
-				}
-				sh := i.(*streamHandler)
-				if mh.Flags&flagNoData != flagNoData {
-					unmarshal := func(obj any) error {
-						err := protoUnmarshal(p, obj)
-						ch.putmbuf(p)
-						return err
-					}
-
-					if err := sh.data(unmarshal); err != nil {
-						if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "data handling error: %v", err)) {
-							return
-						}
-						continue
-					}
-				}
-
-				if mh.Flags&flagRemoteClosed == flagRemoteClosed {
-					sh.closeSend()
-					if len(p) > 0 {
-						if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "data close message cannot include data")) {
-							return
-						}
-						continue
-					}
-				}
-			} else if mh.Type == messageTypeRequest {
-				if mh.StreamID <= lastStreamID {
-					// enforce odd client initiated identifiers.
-					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID cannot be re-used and must increment")) {
-						return
-					}
-					continue
-
-				}
-				lastStreamID = mh.StreamID
-
-				// TODO: Make request type configurable
-				// Unmarshaller which takes in a byte array and returns an interface?
-				var req Request
-				if err := c.server.codec.Unmarshal(p, &req); err != nil {
-					ch.putmbuf(p)
-					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "unmarshal request error: %v", err)) {
-						return
-					}
-					continue
-				}
-				ch.putmbuf(p)
-
-				id := mh.StreamID
-				respond := func(status *status.Status, data []byte, streaming, closeStream bool) error {
+				if _, ok := status.FromError(err); ok {
+					// A grpc status error (e.g. oversized frame) is
+					// reported back on the offending stream id by the
+					// processor, matching the per-stream failure path.
 					select {
-					case responses <- response{
-						id:          id,
-						status:      status,
-						data:        data,
-						closeStream: closeStream,
-						streaming:   streaming,
-					}:
+					case frames <- connFrame{header: mh, payload: p, recvErr: err}:
 					case <-done:
-						return ErrClosed
-					}
-					return nil
-				}
-				sh, err := c.server.services.handle(ctx, &req, respond)
-				if err != nil {
-					status, _ := status.FromError(err)
-					if !sendStatus(mh.StreamID, status) {
-						return
 					}
 					continue
 				}
 
-				streams.Store(id, sh)
-				atomic.AddInt32(&active, 1)
+				select {
+				case recvErr <- err:
+				case <-done:
+				}
+				return
 			}
-			// TODO: else we must ignore this for future compat. log this?
+
+			select {
+			case frames <- connFrame{header: mh, payload: p}:
+			case <-done:
+				return
+			}
 		}
-	}(recvErr)
+	}()
+
+	// processor serializes stream id checks, drain boundary handling
+	// and stream bookkeeping.
+	go func() {
+		defer close(processorDone)
+
+		// drainBoundary is zero until draining is armed; new streams
+		// with an id strictly greater than the boundary are refused.
+		var drainBoundary uint32
+		draining := false
+		legacyDrain := false
+
+		armDrain := func() {
+			if draining {
+				return
+			}
+			draining = true
+			if !c.peerDrain.Load() {
+				// The peer did not negotiate drain: preserve the
+				// legacy Shutdown behavior, force closing only once
+				// the connection is idle.
+				legacyDrain = true
+				return
+			}
+			drainBoundary = lastStreamID
+			sendControl(marshalControl(controlV1{
+				typ:          controlMessageDrainBegin,
+				lastStreamID: drainBoundary,
+			}))
+		}
+
+		handle := func(frame connFrame) {
+			c.processFrame(ctx, frame, ch, &streams, &active,
+				&inFlight, &lastStreamID, &drainBoundary, draining,
+				sendStatus, responses)
+		}
+
+		for {
+			select {
+			case <-c.shutdown:
+				return
+			case <-done:
+				return
+			case <-c.drainReq:
+				// A frame already pulled off the wire takes
+				// precedence, so a received request can never end up
+				// behind the boundary it should be part of. Drain is
+				// armed in the same iteration after such a frame.
+				select {
+				case frame := <-frames:
+					handle(frame)
+				default:
+				}
+				armDrain()
+			case frame := <-frames:
+				handle(frame)
+				if draining && legacyDrain && atomic.LoadInt32(&active) == 0 {
+					return
+				}
+			}
+		}
+	}()
 
 	for {
 		var (
@@ -548,7 +631,19 @@ func (c *serverConn) run(sctx context.Context) {
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
-				atomic.AddInt32(&active, -1)
+				activeRemaining := atomic.AddInt32(&active, -1)
+				inFlightRemaining := atomic.AddInt32(&inFlight, -1)
+				if c.drainComplete(activeRemaining, inFlightRemaining) {
+					return
+				}
+			}
+		case ctrl := <-controls:
+			if err := ch.send(controlStreamID, messageTypeControl, 0, ctrl); err != nil {
+				log.G(ctx).WithError(err).Error("failed sending control message on channel")
+				return
+			}
+			if c.drainComplete(atomic.LoadInt32(&active), atomic.LoadInt32(&inFlight)) {
+				return
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this
@@ -569,9 +664,9 @@ func (c *serverConn) run(sctx context.Context) {
 }
 
 func getRequestContext(ctx context.Context, req *Request) (retCtx context.Context, cancel func()) {
-	if len(req.Metadata) > 0 {
+	if userMetadata := withoutInternalMetadata(req.Metadata); len(userMetadata) > 0 {
 		md := MD{}
-		md.fromRequest(req)
+		md.fromRequest(&Request{Metadata: userMetadata})
 		ctx = WithMetadata(ctx, md)
 	}
 

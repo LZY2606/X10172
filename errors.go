@@ -19,6 +19,7 @@ package ttrpc
 import (
 	"errors"
 
+	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -42,7 +43,47 @@ var (
 	// connection's receive loop. This prevents a single unconsumed
 	// stream from deadlocking all other streams on the same connection.
 	ErrStreamFull = errors.New("ttrpc: stream buffer full")
+
+	// ErrConnectionDraining is the stable, identifiable result returned
+	// to a call that lands on or after a server-announced graceful drain
+	// boundary. It maps to gRPC code Unavailable with a fixed message,
+	// so callers can distinguish deliberate draining from a dropped
+	// connection without guessing from close timing.
+	ErrConnectionDraining error = &drainingError{}
 )
+
+// drainingStatusMessage is the wire-stable status message used for
+// drain rejections. Clients recognize this exact message together with
+// codes.Unavailable and collapse it onto ErrConnectionDraining.
+const drainingStatusMessage = "ttrpc: connection is draining"
+
+// drainingError is returned for calls rejected by a graceful drain
+// boundary, both for local fast-fail on the client and for server
+// responses. It carries a gRPC status so status.FromError and
+// status.Code keep working for callers.
+type drainingError struct{}
+
+func (*drainingError) Error() string { return drainingStatusMessage }
+
+func (*drainingError) GRPCStatus() *status.Status {
+	return status.New(codes.Unavailable, drainingStatusMessage)
+}
+
+// Is reports the sentinel ErrConnectionDraining so errors.Is keeps
+// working even for drain results materialized from a wire status.
+func (*drainingError) Is(target error) bool {
+	return target == ErrConnectionDraining
+}
+
+// statusFromResponse converts a Response status into the local error
+// type, collapsing drain rejections onto ErrConnectionDraining while
+// preserving every other status verbatim.
+func statusFromResponse(st *spb.Status) error {
+	if st != nil && st.Code == int32(codes.Unavailable) && st.Message == drainingStatusMessage {
+		return ErrConnectionDraining
+	}
+	return status.ErrorProto(st)
+}
 
 // OversizedMessageErr is used to indicate refusal to send an oversized message.
 // It wraps a ResourceExhausted grpc Status together with the offending message

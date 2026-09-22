@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -43,6 +44,12 @@ type Client struct {
 	streams      map[streamID]*stream
 	nextStreamID streamID
 	sendLock     sync.Mutex
+
+	drainEnabled  bool
+	drained       chan struct{}
+	drainedOnce   sync.Once
+	drainStarted  atomic.Bool
+	drainBoundary atomic.Uint32
 
 	ctx    context.Context
 	closed func()
@@ -93,6 +100,20 @@ func WithChainUnaryClientInterceptor(interceptors ...UnaryClientInterceptor) Cli
 	}
 }
 
+// WithGracefulDrain opts the client into connection-level graceful
+// drain support. Requests advertise the capability so a drain-aware
+// server may send control frames announcing a stream ID boundary;
+// calls past the boundary then fail with ErrConnectionDraining
+// instead of relying on connection close timing.
+//
+// The option is backward compatible: drain-unaware servers simply
+// ignore the advertised capability and retain the existing behavior.
+func WithGracefulDrain() ClientOpts {
+	return func(c *Client) {
+		c.drainEnabled = true
+	}
+}
+
 func chainUnaryInterceptors(interceptors []UnaryClientInterceptor, final Invoker, info *UnaryClientInfo) Invoker {
 	if len(interceptors) == 0 {
 		return final
@@ -125,6 +146,10 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 
 	for _, o := range opts {
 		o(c)
+	}
+
+	if c.drainEnabled {
+		c.drained = make(chan struct{})
 	}
 
 	if c.interceptor == nil {
@@ -162,6 +187,9 @@ func (c *Client) Call(ctx context.Context, service, method string, req, resp any
 	if metadata, ok := GetMetadata(ctx); ok {
 		metadata.setRequest(creq)
 	}
+	if c.drainEnabled {
+		addClientCapabilities(creq)
+	}
 
 	if dl, ok := ctx.Deadline(); ok {
 		creq.TimeoutNano = time.Until(dl).Nanoseconds()
@@ -179,7 +207,7 @@ func (c *Client) Call(ctx context.Context, service, method string, req, resp any
 	}
 
 	if cresp.Status != nil && cresp.Status.Code != int32(codes.OK) {
-		return status.ErrorProto(cresp.Status)
+		return statusFromResponse(cresp.Status)
 	}
 	return nil
 }
@@ -283,7 +311,7 @@ func (cs *clientStream) RecvMsg(m any) error {
 		}
 
 		if resp.Status != nil && resp.Status.Code != int32(codes.OK) {
-			return status.ErrorProto(resp.Status)
+			return statusFromResponse(resp.Status)
 		}
 
 		cs.c.deleteStream(cs.s)
@@ -366,6 +394,18 @@ func (c *Client) receiveLoop() error {
 					return filterCloseErr(err)
 				}
 			}
+			if msg.header.Type == messageTypeControl {
+				// Control frames are connection scoped and never belong to
+				// an RPC stream. Malformed or unrecognized control payloads
+				// are ignored so forward-compatible extensions cannot
+				// disrupt the connection.
+				c.handleControl(msg.payload)
+				if msg.payload != nil {
+					c.channel.putmbuf(msg.payload)
+				}
+				continue
+			}
+
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
@@ -426,6 +466,18 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		return nil, err
 	}
 
+	// The stream ID is now final. If a drain boundary has already been
+	// announced on this connection, deterministically reject the new
+	// stream without putting anything on the wire. The boundary is
+	// monotonic within the connection, so this cannot flip back.
+	if c.isDrained(s.id) {
+		c.streamLock.Lock()
+		delete(c.streams, s.id)
+		c.streamLock.Unlock()
+		s.closeWithError(ErrConnectionDraining)
+		return nil, ErrConnectionDraining
+	}
+
 	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
 		return s, filterCloseErr(err)
 	}
@@ -455,6 +507,73 @@ func (c *Client) cleanupStreams(err error) {
 		s.closeWithError(err)
 		delete(c.streams, sid)
 	}
+}
+
+// handleControl processes an inbound control frame. Unrecognized or
+// malformed payloads are ignored.
+func (c *Client) handleControl(p []byte) {
+	msg, ok := unmarshalControl(p)
+	if !ok {
+		return
+	}
+	switch msg.typ {
+	case controlMessageDrainBegin:
+		c.drainStarted.Store(true)
+		c.markDrained(streamID(msg.lastStreamID))
+	}
+}
+
+// markDrained records the announced drain boundary. Boundaries are
+// monotonic: a repeated or delayed frame with a smaller last stream ID
+// must never move the boundary backwards.
+func (c *Client) markDrained(last streamID) {
+	if !c.drainEnabled {
+		return
+	}
+	for {
+		cur := c.drainBoundary.Load()
+		if uint32(last) <= cur {
+			return
+		}
+		if c.drainBoundary.CompareAndSwap(cur, uint32(last)) {
+			c.drainedOnce.Do(func() {
+				close(c.drained)
+			})
+			return
+		}
+	}
+}
+
+// isDrained reports whether a stream with the given client-assigned ID
+// is past the announced drain boundary.
+func (c *Client) isDrained(id streamID) bool {
+	if !c.drainEnabled || !c.drainStarted.Load() {
+		return false
+	}
+	return uint32(id) > c.drainBoundary.Load()
+}
+
+// DrainBoundary returns the last accepted stream ID announced by the
+// server when draining began and true once draining has been announced.
+// Until then it returns 0 and false. The boundary never decreases
+// within the lifetime of the connection.
+func (c *Client) DrainBoundary() (uint32, bool) {
+	if !c.drainEnabled || !c.drainStarted.Load() {
+		return 0, false
+	}
+	select {
+	case <-c.drained:
+		return c.drainBoundary.Load(), true
+	default:
+		return 0, false
+	}
+}
+
+// Drained returns a channel that is closed once the server announces a
+// graceful drain boundary on this connection. With WithGracefulDrain
+// not set the returned channel is nil and never closes.
+func (c *Client) Drained() <-chan struct{} {
+	return c.drained
 }
 
 // filterCloseErr rewrites EOF and EPIPE errors to ErrClosed. Use when
@@ -505,6 +624,9 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 		Method:  method,
 		Payload: payload,
 		// TODO: metadata from context
+	}
+	if c.drainEnabled {
+		addClientCapabilities(request)
 	}
 	p, err := c.codec.Marshal(request)
 	if err != nil {

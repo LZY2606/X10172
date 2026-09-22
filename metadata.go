@@ -109,6 +109,19 @@ func (m MD) fromRequest(r *Request) {
 
 type metadataKey struct{}
 
+const (
+	// capabilityMetadataKey is the reserved metadata key under which a
+	// client advertises the optional protocol capabilities it
+	// understands on this connection. It is an implementation detail of
+	// capability negotiation and is stripped before request metadata is
+	// handed to server handlers.
+	capabilityMetadataKey = "ttrpc-capabilities"
+
+	// capabilityDrain advertises support for connection-level graceful
+	// drain control frames.
+	capabilityDrain = "drain"
+)
+
 // GetMetadata retrieves metadata from context.Context (previously attached with WithMetadata)
 func GetMetadata(ctx context.Context) (MD, bool) {
 	metadata, ok := ctx.Value(metadataKey{}).(MD)
@@ -132,4 +145,49 @@ func GetMetadataValue(ctx context.Context, name string) (string, bool) {
 // WithMetadata attaches metadata map to a context.Context
 func WithMetadata(ctx context.Context, md MD) context.Context {
 	return context.WithValue(ctx, metadataKey{}, md)
+}
+
+// addClientCapabilities appends the client's optional protocol
+// capabilities to a Request. The values are consumed by the server only
+// for capability negotiation.
+func addClientCapabilities(req *Request) {
+	req.Metadata = append(req.Metadata, &KeyValue{
+		Key:   capabilityMetadataKey,
+		Value: capabilityDrain,
+	})
+}
+
+// peerSupportsDrain reports whether the request's metadata advertises
+// the drain capability. The value may hold a comma-separated set of
+// capabilities.
+func peerSupportsDrain(req *Request) bool {
+	for _, kv := range req.Metadata {
+		if kv.Key != capabilityMetadataKey {
+			continue
+		}
+		for _, cap := range strings.Split(kv.Value, ",") {
+			if strings.TrimSpace(cap) == capabilityDrain {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// withoutInternalMetadata returns the request metadata intended for
+// handlers, dropping the reserved negotiation keys. The returned slice
+// is a copy when filtering is required; otherwise the request's slice
+// is returned as-is.
+func withoutInternalMetadata(in []*KeyValue) []*KeyValue {
+	if len(in) == 0 {
+		return in
+	}
+	out := in[:0:0]
+	for _, kv := range in {
+		if kv.Key == capabilityMetadataKey {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }

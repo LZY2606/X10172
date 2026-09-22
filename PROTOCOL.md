@@ -56,6 +56,12 @@ initiated streams. Server initiated streams are not currently supported.
 | 0x01         | Request  | Initiates stream                 |
 | 0x02         | Response | Final stream data and terminates |
 | 0x03         | Data     | Stream data                      |
+| 0x04         | Control  | Connection-level control message |
+
+Message types that an implementation does not recognize must be
+ignored: the message payload is consumed according to the header data
+length and protocol processing continues. Control messages must never
+be treated as RPC traffic.
 
 ### Request
 
@@ -109,6 +115,122 @@ considered data and should be processed.
 |------|-----------------|-----------------------------------|
 | 0x01 | `remote closed` | No more data expected from remote |
 | 0x04 | `no data`       | This message does not have data   |
+
+### Control
+
+Control messages are connection scoped rather than belonging to any
+RPC stream. A control frame always uses Stream ID `0`, which is
+neither a valid client (odd) nor a server (even) initiated stream. The
+Stream ID parity checks that apply to requests and data do not apply to
+Stream ID `0`. A peer which does not implement control messages simply
+discards them; under no circumstances may a control frame be delivered
+to a stream handler or reported as an unknown stream error.
+
+The control payload starts with a fixed 12-byte little-agnostic header,
+with all multi-byte integers encoded big-endian:
+
+    +---------------------------------------------------------------+
+    |                    Magic "TRPC" (32 bits)                     |
+    +---------------------------------------------------------------+
+    | Payload Version (8) |        Reserved (24 bits, zero)         |
+    +---------------------------------------------------------------+
+    |                    Control Type (32 bits)                     |
+    +---------------------------------------------------------------+
+
+The 4-byte magic is the ASCII bytes `T`, `R`, `P`, `C`. Payload Version
+`1` is currently defined. A peer must ignore a control frame whose
+magic does not match, whose payload version is not supported, or whose
+payload is shorter than the header, without disturbing the connection.
+
+| Control Type | Name        | Direction | Description                     |
+|--------------|-------------|-----------|---------------------------------|
+| 0x01         | Drain Begin | S -> C    | Announce a drain stream boundary|
+
+Unknown control types for a supported payload version are ignored.
+
+#### Drain Begin
+
+The Drain Begin control type (`0x01`) is sent by the server to announce
+that the connection is being gracefully drained. Its 12-byte header is
+immediately followed by one big-endian uint32, for a total payload of
+16 bytes:
+
+    +---------------------------------------------------------------+
+    |              Last Accepted Stream ID (32 bits)                |
+    +---------------------------------------------------------------+
+
+`Last Accepted Stream ID` is the highest client-initiated stream ID
+that the server had accepted before the boundary. Every stream with an
+ID less than or equal to the boundary that was received before the
+boundary is allowed to run to completion with the usual client
+half-close, server half-close and final status ordering. Requests with
+stream IDs strictly greater than the boundary are rejected by the
+server without dispatching them to a handler.
+
+The boundary is monotonic for the lifetime of a connection. A repeated
+or delayed Drain Begin frame with a smaller stream ID must not move the
+boundary backwards. Boundaries do not carry across reconnects: a fresh
+connection starts with no boundary.
+
+## Capability Negotiation
+
+Graceful drain is optional and is negotiated on the existing metadata
+channel, so no new handshake round trip is required and peers that
+predate the feature keep working unchanged.
+
+A drain-capable client includes a reserved metadata entry on every
+Request it sends:
+
+| Key                 | Value |
+|---------------------|-------|
+| `ttrpc-capabilities`| drain |
+
+The value may be a comma-separated list of capability tokens, allowing
+future extensions to share the key. The key is reserved for protocol
+negotiation and is stripped before request metadata is exposed to a
+server handler; user metadata never sees it.
+
+Once the server observes the `drain` token on any request of a
+connection, the connection is considered drain capable and the server
+may send Control frames on it. A server must not send Control frames on
+a connection whose client never advertised the capability.
+
+Capability advertisement is one way per connection role and purely
+additive. A client that does not advertise `drain` receives no control
+frames; a server that does not implement control frames ignores the
+metadata entry.
+
+## Graceful Drain
+
+When a server enters maintenance it initiates a graceful drain:
+
+1. The server stops accepting new connections.
+2. On each drain-capable connection, the receive path first drains any
+   frame already pulled off the wire, snapshots the highest accepted
+   client stream ID and sends one Drain Begin control frame. A frame
+   already received is therefore always classified before the boundary,
+   even if a control frame and a data frame become observable out of
+   order at the transport.
+3. Streams at or below the boundary complete normally.
+4. New requests strictly above the boundary receive a final Response on
+   their own stream ID carrying gRPC status code `Unavailable` (14) with
+   the stable message `ttrpc: connection is draining`, instead of
+   relying on the connection being torn down.
+5. Once every in-flight stream has produced its final response and the
+   boundary frame has been written, the server closes the connection.
+
+On a drain-aware client, calls past the boundary fail with a stable,
+identifiable error (`codes.Unavailable`, message
+`ttrpc: connection is draining`) regardless of whether the client
+locally fast-fails after observing the control frame or the server
+rejects the request. This maps to the client API error
+`ErrConnectionDraining`. Existing streams keep their original ordering:
+client half-close, server half-close and the final status occur exactly
+as without draining.
+
+Connections whose clients did not negotiate the capability retain the
+legacy shutdown behavior: they are not sent control frames, active
+streams are left to finish, and idle connections are closed.
 
 ## Streaming
 
@@ -238,3 +360,4 @@ routing by procedure name and a response type which supports call status.
 |---------|---------------------|
 | 1.0     | Unary requests only |
 | 1.2     | Streaming support   |
+| 1.3     | Control frames and optional graceful drain |
