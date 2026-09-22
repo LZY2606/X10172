@@ -18,6 +18,7 @@ package ttrpc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"math/rand"
@@ -289,6 +290,8 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		conn:      conn,
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
+		drainReq:  make(chan struct{}, 1),
+		drainDone: make(chan struct{}),
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
@@ -306,6 +309,17 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	active       int32  // outstanding streams, accessed atomically
+	lastStreamID uint32 // highest client stream id received, accessed atomically
+
+	peerCaps      uint32 // capabilities advertised by the peer, accessed atomically
+	draining      int32  // atomic bool, set once the drain boundary is published
+	drainBoundary uint32 // last accepted stream id, accessed atomically
+	drainOnce     sync.Once
+	drainReq      chan struct{} // signals the run loop to begin draining
+	drainDone     chan struct{} // closed when drained and idle, or on exit
+	drainDoneOnce sync.Once
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -337,21 +351,20 @@ func (c *serverConn) run(sctx context.Context) {
 	)
 
 	var (
-		ch                     = newChannel(c.conn)
-		ctx, cancel            = context.WithCancel(sctx)
-		state        connState = connStateIdle
-		responses              = make(chan response)
-		recvErr                = make(chan error, 1)
-		done                   = make(chan struct{})
-		streams                = sync.Map{}
-		active       int32
-		lastStreamID uint32
+		ch                    = newChannel(c.conn)
+		ctx, cancel           = context.WithCancel(sctx)
+		state       connState = connStateIdle
+		responses             = make(chan response)
+		recvErr               = make(chan error, 1)
+		done                  = make(chan struct{})
+		streams               = sync.Map{}
 	)
 
 	defer c.conn.Close()
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
+	defer c.finishDrain()
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -441,7 +454,7 @@ func (c *serverConn) run(sctx context.Context) {
 					}
 				}
 			} else if mh.Type == messageTypeRequest {
-				if mh.StreamID <= lastStreamID {
+				if mh.StreamID <= atomic.LoadUint32(&c.lastStreamID) {
 					// enforce odd client initiated identifiers.
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID cannot be re-used and must increment")) {
 						return
@@ -449,7 +462,17 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 
 				}
-				lastStreamID = mh.StreamID
+				atomic.StoreUint32(&c.lastStreamID, mh.StreamID)
+
+				if atomic.LoadInt32(&c.draining) != 0 && mh.StreamID > atomic.LoadUint32(&c.drainBoundary) {
+					// The connection is draining and this stream is past
+					// the published boundary; reject it with a stable,
+					// recognizable status instead of racing a close.
+					if !sendStatus(mh.StreamID, status.New(codes.Unavailable, ErrServerDraining.Error())) {
+						return
+					}
+					continue
+				}
 
 				// TODO: Make request type configurable
 				// Unmarshaller which takes in a byte array and returns an interface?
@@ -488,7 +511,12 @@ func (c *serverConn) run(sctx context.Context) {
 				}
 
 				streams.Store(id, sh)
-				atomic.AddInt32(&active, 1)
+				atomic.AddInt32(&c.active, 1)
+			} else if mh.Type == messageTypeControl {
+				c.handleControl(mh, p)
+				if len(p) > 0 {
+					ch.putmbuf(p)
+				}
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -500,7 +528,7 @@ func (c *serverConn) run(sctx context.Context) {
 			shutdown chan struct{}
 		)
 
-		activeN := atomic.LoadInt32(&active)
+		activeN := atomic.LoadInt32(&c.active)
 		if activeN > 0 {
 			newstate = connStateActive
 			shutdown = nil
@@ -511,6 +539,11 @@ func (c *serverConn) run(sctx context.Context) {
 		if newstate != state {
 			c.setState(newstate)
 			state = newstate
+		}
+		if activeN == 0 && atomic.LoadInt32(&c.draining) != 0 {
+			// The drain boundary is published and all streams accepted
+			// before it have finished.
+			c.finishDrain()
 		}
 
 		select {
@@ -548,7 +581,21 @@ func (c *serverConn) run(sctx context.Context) {
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
-				atomic.AddInt32(&active, -1)
+				atomic.AddInt32(&c.active, -1)
+			}
+		case <-c.drainReq:
+			atomic.StoreInt32(&c.draining, 1)
+			boundary := atomic.LoadUint32(&c.lastStreamID)
+			atomic.StoreUint32(&c.drainBoundary, boundary)
+			if atomic.LoadUint32(&c.peerCaps)&capabilityDrain != 0 {
+				// The peer advertised drain support; publish the
+				// boundary so it can fail fast on new streams.
+				var p [4]byte
+				binary.BigEndian.PutUint32(p[:], boundary)
+				if err := ch.send(0, messageTypeControl, controlFlagDrain, p[:]); err != nil {
+					log.G(ctx).WithError(err).Error("failed sending drain control frame")
+					return
+				}
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this

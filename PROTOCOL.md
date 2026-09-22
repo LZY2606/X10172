@@ -56,6 +56,7 @@ initiated streams. Server initiated streams are not currently supported.
 | 0x01         | Request  | Initiates stream                 |
 | 0x02         | Response | Final stream data and terminates |
 | 0x03         | Data     | Stream data                      |
+| 0x04         | Control  | Connection scoped control frame  |
 
 ### Request
 
@@ -109,6 +110,66 @@ considered data and should be processed.
 |------|-----------------|-----------------------------------|
 | 0x01 | `remote closed` | No more data expected from remote |
 | 0x04 | `no data`       | This message does not have data   |
+
+### Control
+
+Control frames carry connection scoped operations and are never associated
+with a stream. The Stream ID field of a control frame must be zero and must
+be ignored by the receiver. The Flags field of the frame header identifies
+the control operation. Receivers must ignore control frames with unknown
+operations, and implementations that predate control frames must ignore
+unknown message types, so control frames are always safe to send to a peer
+that has advertised no capabilities.
+
+The defined control operations are:
+
+| Flag | Name           | Description                                  |
+|------|----------------|----------------------------------------------|
+| 0x01 | `capabilities` | Advertise the capabilities of the sender     |
+| 0x02 | `drain`        | Announce a graceful connection drain         |
+
+#### Capabilities
+
+The `capabilities` frame carries a 4-byte big-endian bitmask describing the
+features understood by the sender. The following bits are defined:
+
+| Bit        | Name    | Description                              |
+|------------|---------|------------------------------------------|
+| 0x00000001 | `drain` | The sender understands `drain` frames    |
+
+Unknown bits must be ignored. A client that supports graceful connection
+draining sends a `capabilities` frame with the `drain` bit set immediately
+after connection setup. A server must not send `drain` frames on a
+connection unless the client has advertised the `drain` capability on that
+connection. Servers always accept `capabilities` frames; clients currently
+ignore them.
+
+#### Drain
+
+The `drain` frame is sent by a server to announce a graceful connection
+drain. The frame data is a 4-byte big-endian unsigned integer holding the
+last stream identifier the server accepts on this connection, the drain
+boundary.
+
+Streams with identifiers at or below the boundary were received before the
+drain began and run to completion with the usual semantics: client
+half-close, server half-close, and the final status happen in the original
+order. Requests with stream identifiers above the boundary are rejected
+with a response status of `Unavailable` (code 14) and the message
+`ttrpc: server is draining`. Because client stream identifiers increase
+monotonically on a connection, this gives a stable, recognizable rejection
+that does not depend on connection close timing.
+
+The drain boundary is monotonic: once announced it may only move forward.
+Receivers must ignore a `drain` frame whose boundary is not greater than a
+boundary already observed on the same connection. A boundary observed on
+one connection has no meaning on any other connection, so reconnecting
+starts with no boundary.
+
+After draining, a client fails new streams and calls locally with
+`ErrServerDraining`. A rejection that raced with the drain announcement is
+delivered as the wire status described above and is mapped by the client to
+an error matching `ErrServerDraining` with code `Unavailable`.
 
 ## Streaming
 
@@ -238,3 +299,4 @@ routing by procedure name and a response type which supports call status.
 |---------|---------------------|
 | 1.0     | Unary requests only |
 | 1.2     | Streaming support   |
+| 1.3     | Graceful connection draining |

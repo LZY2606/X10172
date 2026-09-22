@@ -18,6 +18,7 @@ package ttrpc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -52,6 +53,12 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+
+	drainSupport bool
+	drainMu      sync.Mutex
+	draining     bool
+	drainLast    streamID
+	drainedCh    chan struct{}
 }
 
 // ClientOpts configures a client
@@ -121,6 +128,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+		drainedCh:       make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -129,6 +137,14 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 
 	if c.interceptor == nil {
 		c.interceptor = defaultClientInterceptor
+	}
+
+	if c.drainSupport {
+		var caps [4]byte
+		binary.BigEndian.PutUint32(caps[:], capabilityDrain)
+		if err := c.send(0, messageTypeControl, controlFlagCapabilities, caps[:]); err != nil {
+			log.G(ctx).WithError(err).Debug("ttrpc: failed to advertise capabilities")
+		}
 	}
 
 	go c.run()
@@ -283,6 +299,9 @@ func (cs *clientStream) RecvMsg(m any) error {
 		}
 
 		if resp.Status != nil && resp.Status.Code != int32(codes.OK) {
+			if isDrainStatus(resp.Status) {
+				return asDrainError(resp.Status)
+			}
 			return status.ErrorProto(resp.Status)
 		}
 
@@ -366,6 +385,10 @@ func (c *Client) receiveLoop() error {
 					return filterCloseErr(err)
 				}
 			}
+			if err == nil && msg.header.Type == messageTypeControl {
+				c.handleControl(msg.header, msg.payload)
+				continue
+			}
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
@@ -401,6 +424,15 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	case <-c.ctx.Done():
 		return nil, ErrClosed
 	default:
+	}
+
+	c.drainMu.Lock()
+	draining, drainLast := c.draining, c.drainLast
+	c.drainMu.Unlock()
+	if draining && c.nextStreamID > drainLast {
+		// The server announced a drain boundary below the next stream
+		// identifier; fail fast instead of racing the rejection.
+		return nil, ErrServerDraining
 	}
 
 	var s *stream
@@ -560,6 +592,9 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 
 	if msg.header.Type == messageTypeResponse {
 		err = proto.Unmarshal(msg.payload[:msg.header.Length], resp)
+		if err == nil && isDrainStatus(resp.Status) {
+			err = asDrainError(resp.Status)
+		}
 	} else {
 		err = fmt.Errorf("unexpected %q message received: %w", msg.header.Type, ErrProtocol)
 	}
