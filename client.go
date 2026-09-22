@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -43,6 +44,15 @@ type Client struct {
 	streams      map[streamID]*stream
 	nextStreamID streamID
 	sendLock     sync.Mutex
+
+	draining   atomic.Bool
+	drainBound atomic.Uint32
+
+	// drainObserved is closed once the client applies a drain
+	// announcement. It is unexported and used by tests to script exact
+	// interleavings without sleeps.
+	drainObservedOnce sync.Once
+	drainObserved     chan struct{}
 
 	ctx    context.Context
 	closed func()
@@ -119,6 +129,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		nextStreamID:    1,
 		closed:          cancel,
 		ctx:             ctx,
+		drainObserved:   make(chan struct{}),
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
 	}
@@ -338,6 +349,17 @@ func (c *Client) UserOnCloseWait(ctx context.Context) error {
 }
 
 func (c *Client) run() {
+	// Advertise graceful drain support before any RPC frame. Peers which do
+	// not understand control frames reply with an error on stream id 0,
+	// which the receive loop discards; regular RPCs are unaffected.
+	if err := c.send(controlStreamID, messageTypeControl, 0,
+		marshalControl(FeatureGracefulDrain, 0, false)); err != nil {
+		c.Close()
+		c.cleanupStreams(filterCloseErr(err))
+		c.userCloseFunc()
+		close(c.userCloseWaitCh)
+		return
+	}
 	err := c.receiveLoop()
 	c.Close()
 	c.cleanupStreams(err)
@@ -367,6 +389,24 @@ func (c *Client) receiveLoop() error {
 				}
 			}
 			sid := streamID(msg.header.StreamID)
+			if sid == streamID(controlStreamID) {
+				// Connection-level frames never belong to an RPC stream.
+				if msg.header.Type == messageTypeControl {
+					_, boundary, draining := parseControl(msg.payload[:msg.header.Length])
+					if draining {
+						for {
+							old := c.drainBound.Load()
+							if boundary <= old || c.drainBound.CompareAndSwap(old, boundary) {
+								break
+							}
+						}
+						c.draining.Store(true)
+						c.drainObservedOnce.Do(func() { close(c.drainObserved) })
+					}
+				}
+				c.channel.putmbuf(msg.payload)
+				continue
+			}
 			s := c.getStream(sid)
 			if s == nil {
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
@@ -415,6 +455,13 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		case <-c.ctx.Done():
 			return ErrClosed
 		default:
+		}
+
+		// Once the server announced a drain boundary, new calls beyond it
+		// fail locally with the same stable Unavailable error the server
+		// would send, without racing the connection's teardown.
+		if c.draining.Load() && c.nextStreamID > streamID(c.drainBound.Load()) {
+			return &drainingError{lastStreamID: c.drainBound.Load()}
 		}
 
 		s = newStream(c.nextStreamID, c, recvBuf)

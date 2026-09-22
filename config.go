@@ -24,6 +24,10 @@ import (
 type serverConfig struct {
 	handshaker  Handshaker
 	interceptor UnaryServerInterceptor
+	// gracefulDrain enables the optional graceful drain protocol. Only
+	// connections that negotiated the FeatureGracefulDrain capability are
+	// affected by Server.Drain; default behavior is unchanged when false.
+	gracefulDrain bool
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -39,6 +43,25 @@ func WithServerHandshaker(handshaker Handshaker) ServerOpt {
 			return errors.New("only one handshaker allowed per server")
 		}
 		c.handshaker = handshaker
+		return nil
+	}
+}
+
+// WithGracefulDrain enables the optional connection-level graceful drain
+// protocol. When enabled, ttrpc clients negotiate the FeatureGracefulDrain
+// capability during connection setup. Once Server.Drain is called, each
+// negotiated connection announces a last accepted stream id boundary:
+// requests at or below the boundary complete normally and later requests
+// receive a stable codes.Unavailable rejection instead of relying on a
+// dropped connection.
+//
+// Peers which do not understand the new control message keep working with
+// the existing semantics; their connections are never sent drain frames.
+// This is a server-side opt-in; ttrpc clients always advertise the
+// capability harmlessly.
+func WithGracefulDrain() ServerOpt {
+	return func(c *serverConfig) error {
+		c.gracefulDrain = true
 		return nil
 	}
 }

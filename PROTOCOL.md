@@ -56,6 +56,7 @@ initiated streams. Server initiated streams are not currently supported.
 | 0x01         | Request  | Initiates stream                 |
 | 0x02         | Response | Final stream data and terminates |
 | 0x03         | Data     | Stream data                      |
+| 0x04         | Control  | Connection-level control message |
 
 ### Request
 
@@ -109,6 +110,83 @@ considered data and should be processed.
 |------|-----------------|-----------------------------------|
 | 0x01 | `remote closed` | No more data expected from remote |
 | 0x04 | `no data`       | This message does not have data   |
+
+### Control
+
+The control message is a connection-level message and is never associated
+with an RPC stream. Control messages always use stream id `0`; peers MUST
+ignore unknown message types received on stream id `0` and MUST NOT route a
+control frame to an RPC handler. Stream id `0` is not a valid client or
+server initiated stream identifier.
+
+Control messages do not define header flags; flags should be empty. The
+payload is a protobuf message with the following fields:
+
+| Field | Name              | Type | Description                                  |
+|-------|-------------------|------|----------------------------------------------|
+| 1     | `features`        | u64  | Bitmask of connection capabilities           |
+| 2     | `last_stream_id`  | u32  | Last accepted stream id while draining       |
+| 3     | `draining`        | bool | This frame announces that the peer is draining |
+
+Unknown fields MUST be ignored so the message can be extended in the
+future. An empty payload is valid and carries no features.
+
+#### Capability negotiation
+
+Graceful drain is optional and is negotiated per connection. The client
+SHOULD send a control hello as the first frame on a connection, with
+`features` containing the capabilities it supports. A server which enabled
+graceful drain replies with its own control hello advertising the
+capabilities it has in common. A server which did not enable graceful drain
+replies with `features` set to zero.
+
+The currently defined feature bit is:
+
+| Bit  | Name             | Description                    |
+|------|------------------|--------------------------------|
+| 0x01 | `graceful drain` | Supports the drain boundary    |
+
+Negotiation is opportunistic for backward compatibility:
+
+- An older server which does not know the control message replies to stream
+  id `0` using its existing invalid-stream handling. A new client recognizes
+  this as a failed negotiation, discards the frame and keeps using the
+  connection with pre-drain semantics.
+- An older client never sends a hello and never receives a drain frame. The
+  server only drains connections which advertised the capability, so such
+  connections keep their previous behavior.
+- Peers MUST NOT send drain announcements to a connection which did not
+  negotiate the `graceful drain` capability.
+
+#### Graceful drain boundary
+
+When a server enters its maintenance window it starts draining negotiated
+connections. It takes a snapshot of the highest stream id already accepted
+on each connection and sends a control frame with `draining` set to true and
+`last_stream_id` set to that snapshot value.
+
+- Streams with an id less than or equal to `last_stream_id` that were
+  already received are allowed to run to completion unchanged, including
+  client half-close, server half-close and the final response, in their
+  existing order.
+- New requests with a stream id greater than `last_stream_id` MUST be
+  rejected with a stable status and MUST NOT be executed. The rejection is a
+  normal `Response` frame on the rejected stream id, with gRPC status code
+  `Unavailable` (14) and the message `ttrpc: connection is draining`.
+  Late `Data` frames for such a rejected stream are discarded.
+- The boundary is monotonic per connection: a repeated or delayed drain
+  announcement can never move it backwards. A new connection starts with no
+  boundary. Because client stream ids only increase, reconnecting to a
+  different server connection cannot restore rejected calls.
+- The drain boundary does not rely on frame timing. It is evaluated purely
+  from the stream id, so a drain frame which arrives before or after
+  in-flight data frames produces the same acceptance result for a given
+  stream id.
+
+Upon observing a drain announcement the client marks the connection
+draining and returns the same `Unavailable` result for new calls whose
+stream id would exceed the boundary, even when their frames have not yet
+been sent. Calls already in flight continue to completion.
 
 ## Streaming
 
@@ -238,3 +316,4 @@ routing by procedure name and a response type which supports call status.
 |---------|---------------------|
 | 1.0     | Unary requests only |
 | 1.2     | Streaming support   |
+| 1.3     | Control messages and optional graceful drain |

@@ -18,6 +18,7 @@ package ttrpc
 
 import (
 	"errors"
+	"fmt"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -42,7 +43,54 @@ var (
 	// connection's receive loop. This prevents a single unconsumed
 	// stream from deadlocking all other streams on the same connection.
 	ErrStreamFull = errors.New("ttrpc: stream buffer full")
+
+	// ErrDrainNotEnabled is returned from Server.Drain when the server was
+	// created without the WithGracefulDrain option.
+	ErrDrainNotEnabled = errors.New("ttrpc: graceful drain not enabled")
 )
+
+// drainMessage is the stable status message used for every rejection caused
+// by a connection's drain boundary. Keeping the message identical allows
+// local rejections and server-side responses to be recognized the same way.
+const drainMessage = "ttrpc: connection is draining"
+
+// drainingError is returned for calls rejected because they start after the
+// drain boundary of the underlying connection. It maps to the gRPC
+// codes.Unavailable status and is recognizable with IsDraining.
+type drainingError struct {
+	lastStreamID uint32
+}
+
+func (e *drainingError) Error() string {
+	return fmt.Sprintf("%s (last accepted stream id: %d)", drainMessage, e.lastStreamID)
+}
+
+// GRPCStatus implements the gRPC status interface.
+func (e *drainingError) GRPCStatus() *status.Status {
+	return status.New(codes.Unavailable, e.Error())
+}
+
+// Is allows errors.Is(err, ErrConnectionDraining) style checks against
+// locally generated drain rejections.
+func (e *drainingError) Is(target error) bool {
+	return target == ErrConnectionDraining
+}
+
+// ErrConnectionDraining is returned for calls rejected by the local client
+// once the server announced that the connection is draining.
+var ErrConnectionDraining = errors.New(drainMessage)
+
+// IsDraining reports whether err is a rejection caused by the drain
+// boundary. This matches both local rejections (ErrConnectionDraining) and
+// the stable Unavailable status received from a draining server, even
+// across package boundaries where the concrete error type is unavailable.
+func IsDraining(err error) bool {
+	if errors.Is(err, ErrConnectionDraining) {
+		return true
+	}
+	st, ok := status.FromError(err)
+	return ok && st.Code() == codes.Unavailable && st.Message() == drainMessage
+}
 
 // OversizedMessageErr is used to indicate refusal to send an oversized message.
 // It wraps a ResourceExhausted grpc Status together with the offending message
