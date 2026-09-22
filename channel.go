@@ -39,6 +39,10 @@ const (
 	messageTypeRequest  messageType = 0x1
 	messageTypeResponse messageType = 0x2
 	messageTypeData     messageType = 0x3
+	// messageTypeControl is a connection-level message exchanged on
+	// stream ID 0. It is never part of an RPC stream. Peers that do not
+	// understand it must ignore it (see PROTOCOL.md).
+	messageTypeControl messageType = 0x4
 )
 
 func (mt messageType) String() string {
@@ -49,6 +53,8 @@ func (mt messageType) String() string {
 		return "response"
 	case messageTypeData:
 		return "data"
+	case messageTypeControl:
+		return "control"
 	default:
 		return "unknown"
 	}
