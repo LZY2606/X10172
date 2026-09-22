@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -51,6 +52,15 @@ type Client struct {
 	userCloseFunc   func()
 	userCloseWaitCh chan struct{}
 
+	drainEnabled bool
+	peerCaps     uint32 // capability bitmask announced by the peer, accessed atomically
+	drainDone    chan struct{}
+
+	// drain state, guarded by streamLock
+	draining      bool
+	drainBoundary streamID
+	drainComplete bool
+
 	interceptor UnaryClientInterceptor
 }
 
@@ -68,6 +78,19 @@ func WithOnClose(onClose func()) ClientOpts {
 func WithUnaryClientInterceptor(i UnaryClientInterceptor) ClientOpts {
 	return func(c *Client) {
 		c.interceptor = i
+	}
+}
+
+// WithClientDrain enables the connection drain protocol on the client. The
+// client announces the drain capability to the server and processes drain
+// control frames: once the server publishes a drain boundary, new calls and
+// streams on this connection fail fast with ErrDraining and DrainWait
+// reports completion of the in-flight streams accepted before the boundary.
+// Clients without this option never announce the capability and ignore
+// drain control frames, preserving the previous behavior.
+func WithClientDrain() ClientOpts {
+	return func(c *Client) {
+		c.drainEnabled = true
 	}
 }
 
@@ -121,6 +144,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+		drainDone:       make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -338,6 +362,11 @@ func (c *Client) UserOnCloseWait(ctx context.Context) error {
 }
 
 func (c *Client) run() {
+	if c.drainEnabled {
+		// Best-effort capability announcement. Connection errors are
+		// surfaced by the receive loop.
+		_ = c.send(controlStreamID, messageTypeControl, controlOpCapability, controlUint32Payload(capabilityDrain))
+	}
 	err := c.receiveLoop()
 	c.Close()
 	c.cleanupStreams(err)
@@ -363,11 +392,15 @@ func (c *Client) receiveLoop() error {
 				if !ok {
 					// treat all errors that are not an rpc status as terminal.
 					// all others poison the connection.
-					return filterCloseErr(err)
-				}
+				return filterCloseErr(err)
 			}
-			sid := streamID(msg.header.StreamID)
-			s := c.getStream(sid)
+		}
+		if err == nil && msg.header.Type == messageTypeControl {
+			c.handleControl(msg)
+			continue
+		}
+		sid := streamID(msg.header.StreamID)
+		s := c.getStream(sid)
 			if s == nil {
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
 				continue
@@ -417,6 +450,13 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		default:
 		}
 
+		if c.draining {
+			// The server has published a drain boundary and every new
+			// stream id would be beyond it, so fail fast instead of
+			// waiting for the server-side rejection.
+			return ErrDraining
+		}
+
 		s = newStream(c.nextStreamID, c, recvBuf)
 		c.streams[s.id] = s
 		c.nextStreamID = c.nextStreamID + 2
@@ -436,8 +476,86 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 func (c *Client) deleteStream(s *stream) {
 	c.streamLock.Lock()
 	delete(c.streams, s.id)
+	c.checkDrainedLocked()
 	c.streamLock.Unlock()
 	s.closeWithError(nil)
+}
+
+// handleControl processes a connection-level control frame. Unknown or
+// malformed control frames are ignored so that peers speaking different
+// protocol versions continue to interoperate.
+func (c *Client) handleControl(msg *streamMessage) {
+	defer c.channel.putmbuf(msg.payload)
+
+	if msg.header.StreamID != controlStreamID || len(msg.payload) != 4 {
+		log.G(c.ctx).WithField("stream", msg.header.StreamID).Debug("ttrpc: ignoring malformed control frame")
+		return
+	}
+
+	switch msg.header.Flags {
+	case controlOpCapability:
+		atomic.StoreUint32(&c.peerCaps, controlParseUint32(msg.payload))
+	case controlOpDrain:
+		if !c.drainEnabled {
+			return
+		}
+		boundary := streamID(controlParseUint32(msg.payload))
+		c.streamLock.Lock()
+		// The drain boundary is monotonic for the lifetime of the
+		// connection: duplicate or delayed frames must not move it
+		// backwards.
+		if !c.draining || boundary > c.drainBoundary {
+			c.draining = true
+			c.drainBoundary = boundary
+		}
+		c.checkDrainedLocked()
+		c.streamLock.Unlock()
+	default:
+		// Unknown control opcodes are ignored for forward compatibility.
+	}
+}
+
+// checkDrainedLocked closes drainDone once a drain boundary has been
+// received and every stream accepted before the boundary has completed.
+// streamLock must be held.
+func (c *Client) checkDrainedLocked() {
+	if !c.draining || c.drainComplete {
+		return
+	}
+	for id := range c.streams {
+		if id <= c.drainBoundary {
+			return
+		}
+	}
+	c.drainComplete = true
+	close(c.drainDone)
+}
+
+// Draining reports whether the server has announced a drain boundary for
+// this connection.
+func (c *Client) Draining() bool {
+	c.streamLock.RLock()
+	defer c.streamLock.RUnlock()
+	return c.draining
+}
+
+// DrainWait blocks until the server has announced a drain boundary and all
+// streams accepted before the boundary have completed. It returns ErrClosed
+// if the connection closes first, ctx.Err() if the context is done, and nil
+// once the connection is fully drained. DrainWait requires the drain
+// protocol to be enabled with WithClientDrain.
+func (c *Client) DrainWait(ctx context.Context) error {
+	if !c.drainEnabled {
+		return fmt.Errorf("ttrpc: drain support is not enabled on this client")
+	}
+	select {
+	case <-c.drainDone:
+		return nil
+	case <-c.ctx.Done():
+		return ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *Client) getStream(sid streamID) *stream {

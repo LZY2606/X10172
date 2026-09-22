@@ -24,6 +24,7 @@ import (
 type serverConfig struct {
 	handshaker  Handshaker
 	interceptor UnaryServerInterceptor
+	drain       bool
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -50,6 +51,18 @@ func WithUnaryServerInterceptor(i UnaryServerInterceptor) ServerOpt {
 			return errors.New("only one unchained interceptor allowed per server")
 		}
 		c.interceptor = i
+		return nil
+	}
+}
+
+// WithServerDrain enables the connection drain protocol on the server. The
+// server announces the drain capability to clients which support it and
+// honors Server.Drain by notifying those clients of the last accepted
+// stream id on each connection. Servers without this option ignore the
+// drain capability of clients and never send drain control frames.
+func WithServerDrain() ServerOpt {
+	return func(c *serverConfig) error {
+		c.drain = true
 		return nil
 	}
 }

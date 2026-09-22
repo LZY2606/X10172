@@ -37,6 +37,8 @@ type Server struct {
 	services *serviceSet
 	codec    codec
 
+	draining atomic.Bool
+
 	mu          sync.Mutex
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
